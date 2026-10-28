@@ -7,6 +7,7 @@ import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlencode
 import requests
 
 NYC = "https://data.cityofnewyork.us/resource/"
@@ -38,7 +39,7 @@ FT_PER_MI = 5280.0
 SESSION = requests.Session()
 
 
-POOL = 6  # Open Data requests in flight at once; a half-mile comp search went from two minutes to about 40 seconds at six
+POOL = 6  # Bound Open Data concurrency, including paginated ACRIS queries.
 
 
 T0 = time.time()
@@ -188,13 +189,27 @@ def acris_deeds(boro: str, pairs: list[tuple[str, str]], since_iso: str | None, 
     by_block: dict[str, list[str]] = {}
     for b, l in pairs:
         by_block.setdefault(str(int(b)), []).append(str(int(l)))
-    # one legals query per block (60 lots at a time), then the master records for those documents, POOL queries at once
+    if not by_block:
+        return []
     queries = [(block, lots[k:k + 60]) for block, lots in by_block.items() for k in range(0, len(lots), 60)]
+    # OR exact block/lot clauses together, rather than requesting each block.
+    # Bound the encoded URL size; soda still reads every page of each batch.
+    batches, batch = [], []
+    pair_order = {}
+    for index, (block, lots) in enumerate(queries):
+        for lot in lots:
+            pair_order[(block, lot)] = index
+        clause = f"(block='{block}' AND lot in ({','.join(repr(lot) for lot in lots)}))"
+        if batch and len(urlencode({"$where": f"borough='{boro}' AND ({' OR '.join(batch + [clause])})"})) > 6000:
+            batches.append(batch)
+            batch = []
+        batch.append(clause)
+    batches.append(batch)
 
-    def legals_for(q: tuple[str, list[str]]) -> list[dict]:
-        block, lots = q
-        chunk = ",".join(f"'{x}'" for x in lots)
-        return soda(DS["legals"], {"$where": f"borough='{boro}' AND block='{block}' AND lot in ({chunk})", "$select": "document_id,block,lot"})
+    def legals_for(clauses: list[str]) -> list[dict]:
+        return soda(DS["legals"], {"$where": f"borough='{boro}' AND ({' OR '.join(clauses)})", "$select": "document_id,block,lot"})
+
+    master_select = "document_id,document_date,document_amt,recorded_datetime"
 
     def deeds_for(chunk_ids: list[str]) -> list[dict]:
         chunk = ",".join(f"'{x}'" for x in chunk_ids)
@@ -203,11 +218,40 @@ def acris_deeds(boro: str, pairs: list[tuple[str, str]], since_iso: str | None, 
             where += f" AND document_date >= '{since_iso}T00:00:00.000'"
         if min_amt:
             where += f" AND document_amt >= {min_amt}"
-        return soda(DS["master"], {"$where": where, "$select": "document_id,document_date,document_amt,recorded_datetime"})
+        return soda(DS["master"], {"$where": where, "$select": master_select})
 
-    legals = [x for rows in _parallel(legals_for, queries) for x in rows]
+    legals = [x for rows in _parallel(legals_for, batches) for x in rows]
+    # Preserve the previous per-block/chunk order, including same-day sale ties.
+    legals.sort(key=lambda x: pair_order[(str(int(x["block"])), str(int(x["lot"])))])
     ids = sorted({x["document_id"] for x in legals})
-    deeds = {m["document_id"]: m for rows in _parallel(deeds_for, [ids[k:k + 150] for k in range(0, len(ids), 150)]) for m in rows}
+    since = dt.date.fromisoformat(since_iso) if since_iso else None
+    today = dt.date.today()
+    if since and 0 <= (today - since).days <= 730 and len(ids) > 3000:
+        # Dense neighborhood searches otherwise request tens of thousands of
+        # historical mortgage/document IDs just to discard almost all of them.
+        # Read recent qualifying deeds citywide and join by the same IDs instead.
+        # Disjoint date windows allow bounded concurrency; the last is unbounded
+        # above so even future-dated source records retain the original coverage.
+        starts = [since]
+        while starts[-1] + dt.timedelta(days=120) < today:
+            starts.append(starts[-1] + dt.timedelta(days=120))
+        windows = [(start, starts[i + 1] if i + 1 < len(starts) else None) for i, start in enumerate(starts)]
+
+        def recent_deeds(window: tuple[dt.date, dt.date | None]) -> list[dict]:
+            start, end = window
+            where = f"doc_type='DEED' AND document_date >= '{start.isoformat()}T00:00:00.000'"
+            if end:
+                where += f" AND document_date < '{end.isoformat()}T00:00:00.000'"
+            if min_amt:
+                where += f" AND document_amt >= {min_amt}"
+            return soda(DS["master"], {"$where": where, "$select": master_select})
+
+        pages = _parallel(recent_deeds, windows)
+    else:
+        # Single-property history, sparse areas and long historical windows
+        # remain scoped to their document IDs rather than a citywide download.
+        pages = _parallel(deeds_for, [ids[k:k + 150] for k in range(0, len(ids), 150)])
+    deeds = {m["document_id"]: m for rows in pages for m in rows}
     # count how many lots each document covers (multi-lot sales)
     lots_per_doc: dict[str, set] = {}
     for x in legals:

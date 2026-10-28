@@ -30,8 +30,29 @@ All calls are `GET https://data.cityofnewyork.us/resource/<dataset>.json` with S
 | Neighborhood name and outlines | NTA 2020 `9nt8-h7nd` | `$where=intersects(the_geom, 'POLYGON((lon lat, ...))')`; ntaname, the_geom | `nta_polygons` |
 | Parks | `enfh-gkve` | `$where=intersects(multipolygon, 'POLYGON((...))') AND typecategory in (...)`; signname, typecategory, acres, multipolygon | `place_sources.collect` |
 | Shared restaurant identities and coordinates | DOHMH inspection records `43nn-pn8j` | Match existing area names to dba and nearby coordinates; dedupe by camis. Keep public business name, address, latitude and longitude. Ambiguous matches remain unresolved; no Google ratings are copied | `place_sources.collect` |
-| Comp candidates | PLUTO, then ACRIS | PLUTO `$where=latitude between 40.676 and 40.690 AND longitude between -73.968 and -73.950 AND bldgclass like 'V%'` for land, `'A%'`, `'B%'`, `'C%'` for houses and walk-ups. Legals one query per candidate block (`block='3424' AND lot in (...)`), six queries in flight at once; master with `doc_type='DEED' AND document_date >= ... AND document_amt > 100000`; join back by block and lot for area and class. A half-mile search touches about 130 blocks and takes under a minute | `find_comps`, `acris_deeds` |
+| Comp candidates | PLUTO, then ACRIS | PLUTO `$where=latitude between 40.676 and 40.690 AND longitude between -73.968 and -73.950 AND bldgclass like 'V%'` for land, `'A%'`, `'B%'`, `'C%'` for houses and walk-ups. Legals batches OR exact `(block='3424' AND lot in (...))` clauses within one borough. Master uses `doc_type='DEED'`, the requested date window and `document_amt >=` the requested minimum; join back by document ID, block and lot for area and class. Apply the exact distance after the bounding box. See the lookup strategy below | `find_comps`, `acris_deeds` |
 | Assessed value, exemptions, tax class | Property Valuation and Assessment Data `yjxr-fw8i` | by bble (BBL); fullval, avtot, extot, exmptcl, taxclass, owner. The tax bill itself is not here (see Browser only) | not in the script |
+
+### ACRIS lookup strategy
+
+Legals batches keep each block tied to its own lots, with a 6,000-character
+encoded WHERE budget. Every batch is paginated, with at most six requests in
+flight. The original per-block result order is restored before grouping sales.
+
+For searches starting within the past 730 days with more than 3,000 historical
+document IDs, fetch qualifying deeds citywide in disjoint 120-day windows, then
+join them to the requested lots. Every window is paginated; the final window
+has no upper date bound, retaining future-dated source records. This avoids
+hundreds of requests for old mortgages and other documents that would be
+discarded by the deed/date/amount filters. Sparse, undated and longer historical
+searches still fetch master records by document ID. Sales-history queries keep
+zero-dollar deeds. No local cache or API key is required.
+
+A live comparison on 2026-10-28 for 125 Linden Street, Brooklyn (0.5 miles,
+18 months, $100,000 minimum) reduced the ACRIS stage from 28.0 to 5.1 seconds
+and its requests from 531 to 29. The 121 deed rows and all 90 candidate comp
+records matched exactly, including ordering and multi-lot flags. These are
+observed timings, not a service guarantee; API response times vary.
 
 ## Other APIs, no key
 

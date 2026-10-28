@@ -1,5 +1,6 @@
 # pip install -r requirements.txt   (Python 3.10 or newer)
 requests>=2.31
+websocket-client>=1.8  # rendered listing media through an existing local Chrome session
 # The two below draw the maps. If they will not install, `pip install requests` alone still runs the screen; it then
 # writes the pin list without the map images and says so in the run log.
 matplotlib>=3.7

@@ -28,7 +28,7 @@ Agent-specific notes live in `docs/agents/`: `INSTINCT.md` for Noah's assistant 
    python3 ~/notion-underwriting/scripts/screen.py "<address>" --borough BK --ask <n> --strategy <Flip|Rent|Build> --listing <url> --notion
    ```
 
-   Stages 0 to 3 from the APIs, both maps, the row, the comp rows and the page body, in one to three minutes, with a progress line per stage. `--bbl <bbl>` replaces the address. `--out <dir>` instead of `--notion` writes the same page as markdown and JSON and touches nothing in Notion. `--check` prints the environment check alone. No listing link from Noah: find the live listing by address first (`docs/PLAYBOOK.md`, section 2) and pass its ask.
+   Stages 0 to 3 from the APIs, native map locations, the row, comp rows and page body, with a progress line per stage. Area facts reuse the shared place directory. `--refresh-area` explicitly refreshes area sources; `--map-images` explicitly renders legacy images. `--bbl <bbl>` replaces the address. `--out <dir>` instead of `--notion` writes markdown and JSON and makes no Notion writes. `--check` prints the environment check alone. No listing link from Noah: find the live listing by address first (`docs/PLAYBOOK.md`, section 2) and pass its ask.
 
 3. **Finish by hand** what no API reaches (`docs/PLAYBOOK.md`, section 1): the photo, the listing's facts, the tax bill, the listing pass on each comp, the Rents table, exit comps, then sentences 1 and 3 of the top paragraph and the open items.
 

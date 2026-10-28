@@ -1,18 +1,19 @@
 #!/usr/bin/env python
 """Stages 0 to 3 for one NYC property: PLUTO / ACRIS / DOB / HPD facts, the flood zone from FEMA's effective and the city's 2015
 preliminary maps, zoning envelope, classification, closed comps from ACRIS with a renovation signal from DOB alteration jobs,
-two maps, and (with --notion) the deal row, comp rows and page body in the Properties database (one row per building; see
+native map locations, and (with --notion) the deal row, comp rows and page body in the shared Properties database (see
 docs/NOTION.md). Progress lines carry the seconds since start and are flushed as they happen, so a log file shows where a run is.
 
   python3 scripts/screen.py "63 Irving Place" --borough BK --ask 499999 --strategy Build --listing https://... --notion
-  python3 scripts/screen.py --bbl 3019840005 --ask 499999 --out $TMPDIR/irving     # dry run: .md, .json and PNGs, nothing written
+  python3 scripts/screen.py --bbl 3019840005 --ask 499999 --out $TMPDIR/irving     # dry run: .md and .json; add --map-images for PNGs
   python3 scripts/screen.py --check                                                 # environment check
 
 Python 3.10 or newer. Required: requests. Optional: matplotlib and pillow for the two maps (without them the run still produces
 every fact, the comps and the pin list), GOOGLE_MAPS_API_KEY in the environment for the Street View photo and the
 cafe/restaurant layer with ratings, NOTION_TOKEN for --notion. Maps are OpenStreetMap street tiles with the city's neighborhood
 outlines and numbered pins, no text in the image; the pin list and the source caption become Notion blocks under the image.
-TILE_URL overrides the tile server.
+Normal runs reuse the shared area directory; --refresh-area explicitly fetches area sources again. --map-images enables
+legacy map image rendering. TILE_URL overrides the tile server for those explicit exports.
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ import json
 import math
 import os
 import re
+import shlex
 import sys
 import time
 import urllib.parse
@@ -32,12 +34,34 @@ import requests
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
+from comp_review import apply_review, listing_cell, read_review, review_template
+
+
+def load_local_env(path: Path) -> None:
+    """Read only known integration settings, without executing shell code or overriding exports."""
+    if not path.is_file():
+        return
+    allowed = {"GOOGLE_MAPS_API_KEY", "GOOGLE_PLACES_API_KEY", "NOTION_TOKEN", "NOTION_API_TOKEN"}
+    for line in path.read_text().splitlines():
+        try:
+            fields = shlex.split(line, comments=True)
+        except ValueError:
+            continue
+        if fields[:1] == ["export"]:
+            fields = fields[1:]
+        if len(fields) == 1:
+            name, separator, value = fields[0].partition("=")
+            if separator and name in allowed and value:
+                os.environ.setdefault(name, value)
+
+
+load_local_env(ROOT / ".env")
 
 NYC = "https://data.cityofnewyork.us/resource/"
 NYS = "https://data.ny.gov/resource/"
 DS = dict(pluto="64uk-42ks", legals="8h5j-fqxa", master="bnx9-e6tj", parties="636b-3b5g", dobviol="3h2n-5cm9",
           ecb="6bgk-3dad", bisjobs="ic3t-wcy2", dobnow="w9ak-ipjd", hpd="wvxf-dwi5", nta="9nt8-h7nd",
-          parks="enfh-gkve", schools="wg9x-4ke6", subway="39hk-dx4f")
+          parks="enfh-gkve", schools="wg9x-4ke6", subway="39hk-dx4f", buildings="u9wf-3gbt")
 BORO_CODE = {"MN": "1", "BX": "2", "BK": "3", "QN": "4", "SI": "5"}
 BORO_NAME = {"MN": "Manhattan", "BX": "Bronx", "BK": "Brooklyn", "QN": "Queens", "SI": "Staten Island"}
 LOTTYPE = {"3": "Corner", "4": "Through", "5": "Interior"}
@@ -137,6 +161,38 @@ def rep_point(geom: dict) -> tuple[float, float]:
     return sum(pt[1] for pt in ring) / len(ring), sum(pt[0] for pt in ring) / len(ring)
 
 
+def nearest_park_point(geom: dict, lat: float, lon: float) -> tuple[float, float]:
+    """Closest park boundary in a local distance projection; zero distance inside a park.
+
+    This is an edge, not a verified entrance or a walking route. All polygon components
+    and interior rings participate, so a disconnected park is measured to its near part.
+    """
+    polygons = [geom["coordinates"]] if geom.get("type") == "Polygon" else geom.get("coordinates", [])
+    sx = math.cos(math.radians(lat))
+    best = None
+    for polygon in polygons:
+        if not polygon:
+            continue
+        def inside(ring):
+            return contains({"type": "Polygon", "coordinates": [ring]}, lon, lat)
+        if inside(polygon[0]) and not any(inside(ring) for ring in polygon[1:]):
+            return lat, lon
+        for ring in polygon:
+            for a, b in zip(ring, ring[1:] + ring[:1]):
+                ax, ay = (a[0] - lon) * sx, a[1] - lat
+                bx, by = (b[0] - lon) * sx, b[1] - lat
+                dx, dy = bx - ax, by - ay
+                denom = dx * dx + dy * dy
+                t = max(0, min(1, -(ax * dx + ay * dy) / denom)) if denom else 0
+                x, y = ax + t * dx, ay + t * dy
+                candidate = (x * x + y * y, lat + y, lon + x / sx)
+                if best is None or candidate[0] < best[0]:
+                    best = candidate
+    if best is None:
+        raise ValueError("Park geometry has no boundary")
+    return best[1], best[2]
+
+
 def bbox(lat, lon, radius_mi):
     d = radius_mi / MI_PER_DEG_LAT
     dlon = radius_mi / (MI_PER_DEG_LAT * math.cos(math.radians(lat)))
@@ -222,14 +278,22 @@ def dob_facts(boro: str, block: str, lot: str, bbl: str) -> dict:
                               "$select": "job_filing_number,job_type,filing_status,filing_date,approved_date,signoff_date,proposed_dwelling_units,total_construction_floor_area,bin,job_description"})
     hpd = soda(DS["hpd"], {"$where": f"bbl='{bbl}'", "$select": "class,violationstatus,novissueddate,novdescription,registrationid,bin,buildingid"})
     bins = {x.get("bin") for x in viol} | {x.get("bin") for x in ecb} | {x.get("bin__") for x in bis} | {x.get("bin") for x in now} | {x.get("bin") for x in hpd}
-    bins = sorted(b for b in bins if b and b not in ("0", "", "NULL"))
+    bins = sorted(str(b) for b in bins if b and re.fullmatch(r"[1-5]\d{6}", str(b)) and str(b)[1:] != "000000")
+    bin_source, bin_error = "DOB / HPD", None
+    if not bins:
+        try:
+            footprints = soda(DS["buildings"], {"$where": f"base_bbl='{bbl}'", "$select": "bin,base_bbl"})
+            bins = sorted({str(r["bin"]) for r in footprints if re.fullmatch(r"[1-5]\d{6}", str(r.get("bin", ""))) and str(r["bin"])[1:] != "000000"})
+            bin_source = "NYC building footprints" if bins else None
+        except (RuntimeError, requests.RequestException) as e:
+            bin_source, bin_error = None, type(e).__name__
     open_dob = [v for v in viol if "DISMISSED" not in (v.get("violation_category") or "").upper() and not v.get("disposition_date")]
     open_ecb = [v for v in ecb if (v.get("ecb_violation_status") or "").upper() not in ("RESOLVE", "RESOLVED", "DISMISSED")]
     ecb_balance = sum(fnum(v.get("balance_due"), 0.0) for v in ecb)
     hpd_open = [v for v in hpd if (v.get("violationstatus") or "").lower() == "open"]
     hpd_by_class = {c: sum(1 for v in hpd_open if v.get("class") == c) for c in ("A", "B", "C")}
     active_now = [j for j in now if (j.get("filing_status") or "") not in ("Signed Off", "Withdrawn", "Expired", "LOC Issued")]
-    return {"bins": bins, "dob_viol_total": len(viol), "dob_viol_open": len(open_dob), "ecb_total": len(ecb),
+    return {"bins": bins, "bin_source": bin_source, "bin_error": bin_error, "dob_viol_total": len(viol), "dob_viol_open": len(open_dob), "ecb_total": len(ecb),
             "ecb_open": len(open_ecb), "ecb_balance": ecb_balance, "bis_jobs": bis, "dobnow_jobs": now,
             "hpd_total": len(hpd), "hpd_open": len(hpd_open), "hpd_open_by_class": hpd_by_class,
             "hpd_registered": any(v.get("registrationid") for v in hpd), "active_dobnow": active_now,
@@ -558,9 +622,14 @@ def nta_polygons(lat, lon, radius_mi):
     return soda(DS["nta"], {"$where": f"intersects(the_geom, '{poly}')", "$select": "ntaname,nta2020,the_geom"})
 
 
+def is_food_primary(kind: str | None) -> bool:
+    """A food business's primary type; secondary cafes inside retail stores do not qualify."""
+    return bool(kind and (kind in {"restaurant", "cafe", "bakery", "coffee_shop", "tea_house"} or kind.endswith("_restaurant")))
+
+
 def places_food(lat: float, lon: float, radius_m: int = 800, limit: int = 5) -> list[dict] | None:
     """Cafes, restaurants and bakeries with ratings from Google Places (New). None when no key is set."""
-    key = os.environ.get("GOOGLE_MAPS_API_KEY")
+    key = os.environ.get("GOOGLE_PLACES_API_KEY") or os.environ.get("GOOGLE_MAPS_API_KEY")
     if not key:
         return None
     r = SESSION.post("https://places.googleapis.com/v1/places:searchNearby", timeout=30,
@@ -572,7 +641,7 @@ def places_food(lat: float, lon: float, radius_m: int = 800, limit: int = 5) -> 
         raise RuntimeError(f"places -> {r.status_code}: {r.text[:200]}")
     out = []
     for pl in r.json().get("places", []):
-        if not pl.get("rating"):
+        if not pl.get("rating") or not is_food_primary(pl.get("primaryType")):
             continue
         out.append({"name": pl["displayName"]["text"], "kind": (pl.get("primaryType") or "restaurant").replace("_", " "),
                     "rating": pl["rating"], "ratings": int(pl.get("userRatingCount") or 0),
@@ -604,6 +673,55 @@ def area_layers(p: dict, radius_mi: float) -> dict:
         out["failed"].append("food: no Google key")
     layer("ntas", lambda: nta_polygons(lat, lon, radius_mi), [])
     return out
+
+
+def shared_area_layers(p: dict, radius_mi: float, from_notion: bool = False) -> dict:
+    """Reuse the shared amenity directory; no Places search or map tile download."""
+    catalog_path = ROOT / "data" / "amenities.json"
+    records = json.loads(catalog_path.read_text()) if catalog_path.exists() else []
+    if from_notion:
+        from notion_api import load_state, req
+        db = load_state()["databases"]["properties"]
+        geometry = {r["source_id"]: r for r in records if r["type"] == "Park"}
+        records, cursor = [], None
+        while True:
+            query = {"page_size": 100, "filter": {"or": [{"property": "Type", "select": {"equals": t}}
+                     for t in ("Restaurant", "Park", "Subway station")]}}
+            if cursor:
+                query["start_cursor"] = cursor
+            response = req("POST", f"/databases/{db}/query", query, version="2022-06-28")
+            for row in response["results"]:
+                props = row["properties"]
+                location = props.get("Location", {}).get("place")
+                if not location:
+                    continue
+                def plain(name):
+                    return "".join(x.get("plain_text", "") for x in props.get(name, {}).get("rich_text", []))
+                sid = plain("Source ID") or "notion:" + row["id"]
+                record = dict(geometry.get(sid, {}))
+                record.update({"source_id": sid, "name": "".join(x.get("plain_text", "") for x in props["Name"]["title"]),
+                               "type": props["Type"]["select"]["name"], "lat": location["lat"], "lon": location["lon"]})
+                records.append(record)
+            if not response.get("has_more"):
+                break
+            cursor = response["next_cursor"]
+    lat, lon = fnum(p["latitude"]), fnum(p["longitude"])
+    la, lb, lo, hi = bbox(lat, lon, radius_mi)
+    near = [r for r in records if la <= r["lat"] <= lb and lo <= r["lon"] <= hi]
+    stations = [{"stop_name": re.sub(r"\s*\(.*?\)$", "", r["name"]),
+                 "daytime_routes": r.get("routes") or (re.search(r"\((.*?)\)$", r["name"])[1] if re.search(r"\((.*?)\)$", r["name"]) else ""),
+                 "gtfs_latitude": r["lat"], "gtfs_longitude": r["lon"]} for r in near if r["type"] == "Subway station"]
+    food = [{"name": r["name"], "kind": "restaurant", "lat": r["lat"], "lon": r["lon"]} for r in near if r["type"] == "Restaurant"]
+    food.sort(key=lambda f: haversine_mi(lat, lon, f["lat"], f["lon"]))
+    parks = []
+    for record in records:
+        if record["type"] != "Park" or not record.get("geometry"):
+            continue
+        edge_lat, edge_lon = nearest_park_point(record["geometry"], lat, lon)
+        if haversine_mi(lat, lon, edge_lat, edge_lon) <= radius_mi * math.sqrt(2):
+            parks.append({"signname": record["name"], "acres": record.get("acres"), "multipolygon": record["geometry"]})
+    return {"subway": stations, "food": food[:5], "parks": parks, "ntas": nta_polygons(lat, lon, radius_mi),
+            "food_source": "shared place directory", "failed": []}
 
 
 TILE_URL = os.environ.get("TILE_URL", "https://tile.openstreetmap.org/{z}/{x}/{y}.png")
@@ -694,12 +812,26 @@ def _draw_frame(ax, bm: Basemap, ntas: list[dict]) -> None:
     _PINS.append((sx, sy))
 
 
+def pin_position(x: float, y: float, occupied: list, width: float, height: float, gap: float) -> tuple[float, float]:
+    """Find a nonoverlapping label inside the image; distances remain tied to the actual location."""
+    for radius in range(0, int(max(width, height)) + 1, max(1, int(gap))):
+        count = max(1, math.ceil(2 * math.pi * radius / gap))
+        for k in range(count):
+            px, py = x + radius * math.cos(2 * math.pi * k / count), y + radius * math.sin(2 * math.pi * k / count)
+            if gap / 2 <= px <= width - gap / 2 and gap / 2 <= py <= height - gap / 2 and all(math.hypot(px - a, py - b) >= gap for a, b in occupied):
+                return px, py
+    raise ValueError("Map is too crowded for readable pins")
+
+
 def _pin(ax, x: float, y: float, n: int, color: str, filled: bool = True) -> None:
-    """Numbered circle; nudged right when it would sit on an earlier pin or the star (adjacent lots)."""
-    k = 0
-    while any(abs(x - px) < 20 and abs(y - py) < 20 for px, py in _PINS) and k < 8:
-        x += 24
-        k += 1
+    """Keep numbered circles apart at output resolution; leaders show displaced locations."""
+    anchor = x, y
+    width, height = max(ax.get_xlim()), max(ax.get_ylim())
+    gap = 23 * ax.figure.dpi / 72  # marker diameters are in points, map positions in pixels
+    x, y = pin_position(x, y, _PINS, width, height, gap)
+    if math.hypot(x - anchor[0], y - anchor[1]) > 1:
+        ax.plot([anchor[0], x], [anchor[1], y], color=color, lw=0.8, zorder=7)
+        ax.plot(*anchor, marker=".", ms=3, color=color, zorder=7)
     _PINS.append((x, y))
     ax.plot(x, y, marker="o", ms=17, mfc=color if filled else "white", mec=color if filled else color, mew=2.0, zorder=8)
     ax.text(x, y, str(n), ha="center", va="center", fontsize=7.5, color="white" if filled else color, weight="bold", zorder=9)
@@ -717,12 +849,13 @@ def area_items(p: dict, layers: dict) -> list[tuple[str, str, float, float]]:
         la, lo = fnum(s["gtfs_latitude"]), fnum(s["gtfs_longitude"])
         items.append(("subway", f"{s['stop_name']} ({s['daytime_routes'].strip()}) · subway · {dist(la, lo):.2f} mi", la, lo))
     for f in layers.get("food") or []:
-        items.append(("food", f"{f['name']} · {f['kind']} · {f['rating']} ({f['ratings']:,} ratings) · {dist(f['lat'], f['lon']):.2f} mi", f["lat"], f["lon"]))
+        rating = f" · {f['rating']} ({f['ratings']:,} ratings)" if f.get("rating") is not None and f.get("ratings") is not None else ""
+        items.append(("food", f"{f['name']} · {f['kind']}{rating} · {dist(f['lat'], f['lon']):.2f} mi", f["lat"], f["lon"]))
     parks = sorted(layers["parks"], key=lambda k: -(fnum(k.get("acres"), 0) or 0))
     big = [pk for pk in parks if (fnum(pk.get("acres"), 0) or 0) >= 1.0][:2] or parks[:1]
     for pk in big:
-        la, lo = rep_point(pk["multipolygon"])
-        items.append(("park", f"{pk['signname']} · park, {fnum(pk.get('acres'), 0):.1f} acres · {dist(la, lo):.2f} mi", la, lo))
+        la, lo = nearest_park_point(pk["multipolygon"], lat0, lon0)
+        items.append(("park", f"{pk['signname']} · park, {fnum(pk.get('acres'), 0):.1f} acres · {dist(la, lo):.2f} mi to edge", la, lo))
     return items
 
 
@@ -890,10 +1023,10 @@ def _copy_block(b: dict) -> dict | None:
 PIN_TEXT_COLOR = {"subway": "blue", "food": "red", "park": "green", "comp": "default"}
 
 
-def notion_write(res: dict, area_png: Path | None, comps_png: Path | None, photo: Path | None = None) -> str:
+def notion_write(res: dict, area_png: Path | None, comps_png: Path | None, photo: Path | None = None, refresh: bool = False) -> str:
     """Upsert the deal row and its comp rows in the Properties database (one row per building) and rebuild the page body
     above "Noah's notes"."""
-    from notion_api import append, list_children, load_state, md_to_blocks, page_url, req
+    from notion_api import append, list_children, load_state, location_value, md_to_blocks, page_url, req
     V = "2022-06-28"
     state = load_state()
     db = state["databases"]["deals"]  # the Properties database keeps the historical key
@@ -933,7 +1066,7 @@ def notion_write(res: dict, area_png: Path | None, comps_png: Path | None, photo
 
     # ---- comps: one Comp row per building; a building that is already a Deal row is linked, not changed
     by_bbl: dict[str, list[dict]] = {}
-    for c in res["comps"][:8]:
+    for c in res["comps"][:8] + (res.get("exit_comps", [])[:8] if res["body_md"].get("exit") else []):
         by_bbl.setdefault(c["bbl"], []).append(c)
     say(f"notion: {len(by_bbl)} comp rows")
     comp_ids = []
@@ -941,14 +1074,14 @@ def notion_write(res: dict, area_png: Path | None, comps_png: Path | None, photo
         sales.sort(key=lambda c: str(c["date"]), reverse=True)
         last, prior = sales[0], (sales[1] if len(sales) > 1 else None)
         row = find(cb)
-        if row and (row["properties"].get("Role", {}).get("select") or {}).get("name") == "Deal":
+        if row and (row["properties"].get("Type", {}).get("select") or {}).get("name") == "Deal":
             comp_ids.append(row["id"])
             continue
         buildable = last["basis"] == "Buildable zoning"
         props = {
             "Name": {"title": [{"type": "text", "text": {"content": last["address"] or cb}}]},
             "BBL": text(cb),
-            "Role": {"select": {"name": "Comp"}},
+            "Type": {"select": {"name": "Comp"}},
             "Borough": {"select": {"name": BORO_NAME[p["borough"]]}},
             "Neighborhood": {"select": {"name": res.get("nta") or "Unknown"}},
             "Zoning": {"multi_select": [{"name": last["zone"]}] if last.get("zone") else []},
@@ -962,8 +1095,18 @@ def notion_write(res: dict, area_png: Path | None, comps_png: Path | None, photo
             "Last sale date": {"date": {"start": last["date"]}} if last["date"] else {"date": None},
             "Prior sale": text(f"${prior['price']:,.0f} · {_month(prior['date'])}" if prior else ""),
         }
+        review = last.get("review") or {}
+        location = location_value(last["address"], last.get("lat"), last.get("lon"))
+        if location:
+            props["Location"] = location
+        if review.get("url"):
+            props["Listing URL"] = {"url": review["url"]}
+        if review.get("beds_baths"):
+            props["Beds/baths"] = text(review["beds_baths"])
         if row:
-            props.pop("Role")  # keep whatever it is (Comp)
+            props.pop("Type")  # keep whatever it is (Comp)
+            if prior is None:
+                props.pop("Prior sale")  # a review refresh does not erase a previously researched deed
             props = {k: v for k, v in props.items() if k in have}
             req("PATCH", f"/pages/{row['id']}", {"properties": props}, version=V)
             comp_ids.append(row["id"])
@@ -975,12 +1118,16 @@ def notion_write(res: dict, area_png: Path | None, comps_png: Path | None, photo
     # ---- deal row
     say("notion: deal row, images and page body")
     row = find(bbl)
+    if refresh:
+        if not row:
+            raise ValueError("A section refresh needs an existing deal page")
+        return notion_refresh_sections(res, row["id"], area_png, comps_png, comp_ids, upload)
     zoning = [z for z in (p.get("zonedist1"), p.get("zonedist2"), p.get("overlay1"), p.get("spdist1")) if z]
     rules_cited = ", ".join(dict.fromkeys(s.split("(")[0].strip() for s in res.get("rules", [])))  # "23-22, 23-344"
     props = {
         "Name": {"title": [{"type": "text", "text": {"content": p["address"].title()}}]},
         "BBL": text(bbl),
-        "Role": {"select": {"name": "Deal"}},
+        "Type": {"select": {"name": "Deal"}},
         "Strategy": {"select": {"name": res["strategy"]}},
         "Borough": {"select": {"name": BORO_NAME[p["borough"]]}},
         "Neighborhood": {"select": {"name": res.get("nta") or "Unknown"}},
@@ -1002,6 +1149,10 @@ def notion_write(res: dict, area_png: Path | None, comps_png: Path | None, photo
         "Comps used": {"relation": [{"id": i} for i in comp_ids if i != (row or {}).get("id")]},
         "Rules that mattered": text(rules_cited),
     }
+    location = location_value(p["address"].title(), p.get("latitude"), p.get("longitude"),
+                              f"{p['address'].title()}, {BORO_NAME[p['borough']]}, NY")
+    if location:
+        props["Location"] = location
     if row and res["strategy"] == "Not set" and (row["properties"].get("Strategy", {}).get("select") or {}).get("name") not in (None, "Not set"):
         props.pop("Strategy")  # never downgrade a strategy Noah or Instinct already set
     props = {k: v for k, v in props.items() if k in have}
@@ -1010,6 +1161,9 @@ def notion_write(res: dict, area_png: Path | None, comps_png: Path | None, photo
     links_md, rest_md = res["body_md"]["top"].split("\n\n", 1)
     head = ([img] if photo and (img := upload(photo)) else []) + [md_to_blocks(links_md)[0]]
     body = md_to_blocks(rest_md)
+    if res.get("floor_plan") and (img := upload(Path(res["floor_plan"]))):
+        # Place the plan before Details, following the opening paragraph.
+        body[1:1] = md_to_blocks("### Floor plan") + [img]
     area = md_to_blocks("### Area")
     if area_png and (img := upload(area_png)):
         area.append(img)
@@ -1023,6 +1177,8 @@ def notion_write(res: dict, area_png: Path | None, comps_png: Path | None, photo
         body += md_to_blocks("### Purchase comps") + [img] + md_to_blocks(res["body_md"]["comps"])
     else:
         body += md_to_blocks("### Purchase comps\n\n" + res["body_md"]["comps"])
+    if res["body_md"].get("exit"):
+        body += md_to_blocks("### Exit comps\n\n" + res["body_md"]["exit"])
     body += md_to_blocks(res["body_md"]["bottom"])
     notes = md_to_blocks(f"### {NOTES_HEADING}") + [{"type": "paragraph", "paragraph": {"rich_text": []}}]
 
@@ -1031,7 +1187,9 @@ def notion_write(res: dict, area_png: Path | None, comps_png: Path | None, photo
         req("PATCH", f"/pages/{page_id}", {"properties": props}, version=V)
         old = list_children(page_id)
         notes_idx = next((i for i, b in enumerate(old) if b["type"].startswith("heading") and _plain(b).strip().lower() == NOTES_HEADING.lower()), None)
-        if notes_idx:
+        if notes_idx == 0:
+            raise ValueError("Page starts with Noah's notes; refusing to move or recreate the notes")
+        if notes_idx is not None:
             # insert the new body after the first old block, delete the other old blocks above Noah's notes, then that first block;
             # the notes heading and everything below it are never touched
             for b in old[1:notes_idx]:
@@ -1056,6 +1214,80 @@ def notion_write(res: dict, area_png: Path | None, comps_png: Path | None, photo
     return page_url(page_id)
 
 
+def notion_refresh_sections(res, page_id, area_png, comps_png, comp_ids, upload):
+    """Replace Area and Purchase comps in place; leave all hand-finished facts and notes intact."""
+    from notion_api import list_children, md_to_blocks, page_url, req
+    version = "2022-06-28"
+    old = list_children(page_id)
+    notes_index = next((i for i, b in enumerate(old) if b["type"].startswith("heading") and _plain(b).strip().lower() == NOTES_HEADING.lower()), None)
+    if notes_index is None:
+        raise ValueError("Refresh requires the Noah's notes boundary")
+    headings = {_plain(b).strip().lower(): i for i, b in enumerate(old[:notes_index]) if b["type"].startswith("heading")}
+    for name in ("area", "purchase comps"):
+        if name not in headings or headings[name] >= notes_index:
+            raise ValueError(f"Refresh requires an existing {name} section above Noah's notes")
+    # Prepare every upload before modifying existing page content.
+    area_blocks = []
+    if area_png:
+        img = upload(area_png)
+        if img is None:
+            raise RuntimeError("Area map upload failed; page left intact")
+        area_blocks.append(img)
+    area_blocks += md_to_blocks(res["area_caption"])
+    for kind, line in res.get("area_pins", []):
+        area_blocks.append({"type": "numbered_list_item", "numbered_list_item": {"rich_text": [
+            {"type": "text", "text": {"content": line}, "annotations": {"color": PIN_TEXT_COLOR.get(kind, "default")}}]}})
+    area_blocks += md_to_blocks(res.get("area_tail") or "")
+    comp_blocks = []
+    if comps_png and res["comps"]:
+        img = upload(comps_png)
+        if img is None:
+            raise RuntimeError("Comps map upload failed; page left intact")
+        comp_blocks.append(img)
+    comp_blocks += md_to_blocks(res["body_md"]["comps"])
+    replacements = {"area": area_blocks, "purchase comps": comp_blocks}
+    insertions = []
+    if res["body_md"].get("exit"):
+        if "exit comps" in headings and headings["exit comps"] < notes_index:
+            replacements["exit comps"] = md_to_blocks(res["body_md"]["exit"])
+        else:
+            oi = headings.get("open items")
+            if oi is None or oi == 0 or oi >= notes_index:
+                raise ValueError("Cannot place exit comps safely")
+            insertions.append((old[oi - 1]["id"], md_to_blocks("### Exit comps\n\n" + res["body_md"]["exit"])))
+    if res.get("floor_plan"):
+        img = upload(Path(res["floor_plan"]))
+        if img is None:
+            raise RuntimeError("Floor plan upload failed; page left intact")
+        if "floor plan" in headings and headings["floor plan"] < notes_index:
+            replacements["floor plan"] = [img]
+        else:
+            details = headings.get("details")
+            if details is None or details == 0 or details >= notes_index:
+                raise ValueError("Cannot place floor plan safely")
+            insertions.append((old[details - 1]["id"], md_to_blocks("### Floor plan") + [img]))
+    for after, blocks in insertions:
+        req("PATCH", f"/blocks/{page_id}/children", {"children": blocks, "after": after}, version=version)
+    for name, blocks in replacements.items():
+        i = headings[name]
+        end = next((j for j in range(i + 1, notes_index + 1) if old[j]["type"].startswith("heading")), notes_index)
+        # Keep original content until the full replacement has been appended successfully.
+        after = old[i]["id"]
+        for k in range(0, len(blocks), 100):
+            response = req("PATCH", f"/blocks/{page_id}/children", {"children": blocks[k:k + 100], "after": after}, version=version)
+            after = response["results"][-1]["id"]
+        for b in old[i + 1:end]:
+            req("DELETE", f"/blocks/{b['id']}", version=version)
+    req("PATCH", f"/pages/{page_id}", {"properties": {"Comps used": {"relation": [{"id": i} for i in comp_ids if i != page_id]}}}, version=version)
+    log = md_to_blocks(f"Run log: {res['checked']} · maps and comp review refreshed · {len(res['comps'])} purchase comps; listing facts and notes preserved")
+    # Insert before the untouched notes heading, after the last surviving original block.
+    current = list_children(page_id)
+    ni = next(i for i, b in enumerate(current) if b["id"] == old[notes_index]["id"])
+    req("PATCH", f"/blocks/{page_id}/children", {"children": log, "after": current[ni - 1]["id"]}, version=version)
+    say(f"deal page refreshed {page_url(page_id)}; Noah's notes preserved")
+    return page_url(page_id)
+
+
 # ----------------------------------------------------------------------------- compose
 def _month(d: str) -> str:
     try:
@@ -1072,7 +1304,8 @@ def compose(p, env, cls, dob, corner, comps, layers, legends, last_sale, parties
     acris = f"https://a836-acris.nyc.gov/bblsearch/bblsearch.asp?borough={boro}&block={block}&lot={lot}"
     dof = f"https://propertyinformationportal.nyc.gov/parcels/parcel/{bbl}"
     bins = dob["bins"]
-    bis = f"https://a810-bisweb.nyc.gov/bisweb/PropertyProfileOverviewServlet?bin={bins[0]}" if bins else "https://a810-bisweb.nyc.gov/bisweb/bsqpm01.jsp"
+    bis = f"https://a810-bisweb.nyc.gov/bisweb/PropertyProfileOverviewServlet?bin={bins[0]}" if bins else None
+    bis_link = f"[BIS]({bis})" if bis else ""
     front, depth = fnum(p.get("lotfront"), 0.0), fnum(p.get("lotdepth"), 0.0)
     lot_text = f"{front:g} × {depth:g} ft, {env['lotarea']:,.0f} sf, {env['lot_type'].lower()}" + (" (irregular)" if "Irregular lot" in env["flags"] else "")
     ver = p.get("version", "")
@@ -1085,7 +1318,8 @@ def compose(p, env, cls, dob, corner, comps, layers, legends, last_sale, parties
     historic = p.get("histdist") or p.get("landmark")
     streeteasy = "https://streeteasy.com/building/" + re.sub(r"[^a-z0-9]+", "-", p["address"].lower()).strip("-") + "-" + BORO_NAME[p["borough"]].lower().replace(" ", "-")
     hpd_url = f"https://hpdonline.nyc.gov/hpdonline/building/{dob['hpd_building_id']}/overview" if dob.get("hpd_building_id") else None
-    links = ("" if photo else "No photo · ") + (f"[Listing]({listing}) · " if listing else "Listing: none given · ") + f"[StreetEasy]({streeteasy}) · [ZoLa]({zola}) · [BIS]({bis}) · [ACRIS]({acris}) · [DOF]({dof})"
+    link_items = [f"[StreetEasy]({streeteasy})", f"[ZoLa]({zola})", bis_link, f"[ACRIS]({acris})", f"[DOF]({dof})"]
+    links = ("" if photo else "No photo · ") + (f"[Listing]({listing}) · " if listing else "Listing: none given · ") + " · ".join(x for x in link_items if x)
     rules: list[str] = [env["far_cite"]]
 
     # price basis: buildable sf for land/development, PLUTO sf for standing buildings
@@ -1098,7 +1332,7 @@ def compose(p, env, cls, dob, corner, comps, layers, legends, last_sale, parties
     analogs = [(n, c) for n, c in enumerate(shown, 1)
                if c.get("psf") and not c.get("partial_doc") and not c.get("reno") and (c.get("zone") or "") == zone and c.get("area") and basis_area
                and basis_area / 3 <= c["area"] <= basis_area * 3]
-    psfs = [c["psf"] for c in shown if c.get("psf") and not c.get("partial_doc")]
+    psfs = [c["psf"] for c in shown if c.get("psf") and not c.get("partial_doc") and (c.get("review") or {}).get("condition") == "as_is"]
     yard = max(10.0, 30 - 0.5 * (95 - depth)) if depth else 30.0
     corner_ok = bool(corner) and not corner.get("corner_lot") and corner.get("near_ft") is not None
     corner_name = (corner.get("corner_address") or "").title() if corner else ""
@@ -1169,7 +1403,7 @@ def compose(p, env, cls, dob, corner, comps, layers, legends, last_sale, parties
         opens.append(f"HPD {dob['hpd_open']} (A {hc['A']}, B {hc['B']}, C {hc['C']})")
     viol = ("open: " + ", ".join(opens)) if opens else "none open (DOB, ECB, HPD)"
     jobs = [job_text(j, True) for j in dob["bis_jobs"][:2]] + [job_text(j, False) for j in dob["dobnow_jobs"][:2]]
-    rows.append(("Violations · jobs", viol + (" · jobs: " + "; ".join(jobs) if jobs else " · no DOB jobs on record"), f"[BIS]({bis}), " + (f"[HPD]({hpd_url})" if hpd_url else "HPD")))
+    rows.append(("Violations · jobs", viol + (" · jobs: " + "; ".join(jobs) if jobs else " · no DOB jobs on record"), ", ".join(x for x in (bis_link, f"[HPD]({hpd_url})" if hpd_url else "HPD") if x)))
     if cls["units"] > 0:
         signal = "likely regulated: 6+ units built before 1974" if "Rent regulated?" in flags else "no public regulation signal"
         rows.append(("Taxes · rent regulation", f"taxes unknown · {signal}" + (" · HPD registration: none on record" if not dob["hpd_registered"] else ""), f"[DOF]({dof})"))
@@ -1204,7 +1438,7 @@ def compose(p, env, cls, dob, corner, comps, layers, legends, last_sale, parties
     drawn = layers.get("tiles") is not None  # set by render_area_map; without matplotlib there is no image, only the pin list
     sources = ([TILE_CREDIT, "NYC 2020 neighborhood boundaries"] if drawn else []) + ["MTA stations"]
     if layers.get("food"):
-        sources.append("Google Places")
+        sources.append(layers.get("food_source") or "Google Places")
     sources.append("NYC Parks")
     caption = ("Map: " if drawn else "Nearby: ") + " · ".join(sources) + f" · checked {checked} · straight-line miles"
     gaps = {"subway": "subway: source unreachable", "parks": "parks: source unreachable", "ntas": "neighborhood outlines: source unreachable",
@@ -1214,6 +1448,11 @@ def compose(p, env, cls, dob, corner, comps, layers, legends, last_sale, parties
         notes.append(f"{layers['tiles'][1]} map tiles missing")
     if notes:
         caption += " · " + "; ".join(notes)
+    state_path = ROOT / "data" / "notion_state.json"
+    view_state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    map_id = view_state.get("views", {}).get("neighborhood")
+    if map_id:
+        caption += f" · [Map](https://www.notion.so/{view_state['databases']['properties'].replace('-', '')}?v={map_id.replace('-', '')})"
     area_pins = legends.get("area") or []
     pins = "\n".join(f"{n}. {line}" for n, (_, line) in enumerate(area_pins, 1))
     neg = f"{p['histdist']}: Landmarks review on exterior work, no demolition." if p.get("histdist") else ""
@@ -1244,7 +1483,7 @@ def compose(p, env, cls, dob, corner, comps, layers, legends, last_sale, parties
             psf = f"${c['psf']:,.0f}" if c.get("psf") else "n/a"
             src = f"[ACRIS](https://a836-acris.nyc.gov/bblsearch/bblsearch.asp?borough={boro}&block={c['block']}&lot={c['lot']})"
             price = f"${c['price']:,.0f}" + (" (multi-lot)" if c.get("partial_doc") else "")
-            trows.append(f"| {n} | {c['address']} {src} · {c['dist']:.2f} mi | {c['date']} | {price} | {c.get('zone') or '?'} | {c['area']:,.0f} sf · {basis} | {psf} | {c.get('reno') or ''} |")
+            trows.append(f"| {n} | {c['address']} {src} · {c['dist']:.2f} mi | {c['date']} | {price} | {c.get('zone') or '?'} | {c['area']:,.0f} sf · {basis} | {psf} | {listing_cell(c)} |")
         if analogs:
             sent = "Best analogs: " + ", ".join(f"#{n} {c['address']} at ${c['psf']:,.0f} per {basis_word}" for n, c in analogs)
             sent += f"; the ask is ${ask_psf:,.0f}." if ask_psf else "."
@@ -1268,6 +1507,8 @@ def compose(p, env, cls, dob, corner, comps, layers, legends, last_sale, parties
 
     # ---- open items and run log
     open_items = []
+    if not bins:
+        open_items.append(f"| Building identification number | Legal building record and unit count | NYC building footprints; DOB address record | {AGENT} |")
     if "Near corner" in flags or "Shallow lot" in flags:
         open_items.append("| Survey distance to the corner and the 1961 lot depth | Rear yard 0, 10 or 30 ft, and lot coverage | Survey; DOB ZRD1 pre-determination | Noah → surveyor, architect |")
     if cls["units"] > 0:
@@ -1284,7 +1525,6 @@ def compose(p, env, cls, dob, corner, comps, layers, legends, last_sale, parties
         open_items.append(f"| Flood zone: insurance cost and design elevation | Carrying cost; new construction must sit above the base flood elevation; the 2015 preliminary maps the Building Code uses show {pre} here | Insurance quote; elevation certificate | Noah, architect |")
     elif not flood.get("effective_ok"):
         open_items.append(f"| Flood zone | Flood insurance and elevation rules | FEMA flood map lookup; the service was unreachable on this run | {AGENT} |")
-    open_items.append(f"| Hard cost and exit price per sf | Sets the returns at ask | GC quote; exit comps | Noah, {AGENT} |")
     flood_note = "" if flood.get("effective_ok") and flood.get("preliminary_ok") else (" unreachable" if not flood.get("effective_ok") else ", preliminary maps unreachable")
     bottom = "\n\n".join([
         "### Open items", "| Missing fact | Moves the deal how | Evidence needed | Who |\n| --- | --- | --- | --- |\n" + "\n".join(open_items[:6]),
@@ -1325,8 +1565,81 @@ def fetch_photo(src: str | None, p: dict, path: Path) -> Path | None:
         path.write_bytes(r.content)
         return path
     except Exception as e:  # noqa: BLE001
-        print("photo failed:", str(e)[:160])
+        print("photo failed:", type(e).__name__)  # request URLs may contain the Google key
         return None
+
+
+def write_screen(raw: dict, args) -> dict:
+    """Render one snapshot with persisted listing decisions; refresh never refetches city data."""
+    from listing_media import fetch_floorplan
+    p, layers = raw["pluto"], raw["layers"]
+    out = Path(args.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    slug = re.sub(r"[^a-z0-9]+", "-", p["address"].lower()).strip("-")
+    review = read_review(args.review) if args.review else raw.get("review", {"sales": []})
+    candidates = raw["candidate_comps"]
+    purchase, exits, excluded = apply_review(candidates, review)
+    area_png, comps_png = out / f"{slug}-area.png", out / f"{slug}-comps.png"
+    if have_maps() and args.map_images:
+        legends = {"area": render_area_map(p, layers, args.radius, area_png, raw["checked"])}
+        render_comps_map(p, purchase[:8], layers["ntas"], args.radius, comps_png, raw["checked"])
+    else:
+        say("using native database maps; PNG rendering skipped" if not args.map_images else "maps skipped: install matplotlib and pillow")
+        layers.pop("tiles", None)
+        legends = {"area": [(kind, line) for kind, line, _, _ in area_items(p, layers)]}
+        area_png = comps_png = None
+    photo = Path(raw["photo"]) if raw.get("photo") and Path(raw["photo"]).is_file() else None
+    if args.photo:
+        photo = fetch_photo(args.photo, p, out / f"{slug}-photo.jpg")
+    elif not args.refresh and not photo:
+        photo = fetch_photo(None, p, out / f"{slug}-photo.jpg")
+    floor_plan = raw.get("floor_plan")
+    media_status = raw.get("floor_plan_status", "not checked")
+    if args.floor_plan or args.listing_html or not args.refresh:
+        plan, media_status = fetch_floorplan(args.listing, out / f"{slug}-floor-plan.png", args.floor_plan, args.listing_html, args.browser_url)
+        floor_plan = str(plan) if plan else None
+        say(f"floor plan: {media_status}")
+    if floor_plan and not Path(floor_plan).is_file():
+        floor_plan = None
+    res = compose(p, raw["envelope"], raw["classification"], raw["dob"], raw["corner"], purchase, layers,
+                  legends, raw["last_sale"], raw["parties"], raw["nta"], args.ask, args.listing,
+                  raw["checked"], photo, args.strategy, raw["deeds"], flood=raw["flood"])
+    if exits and res["strategy"] in ("Flip", "Build"):
+        qualifying = exits if res["strategy"] == "Flip" else [c for c in exits if c["review"]["condition"] == "new"]
+        if qualifying:
+            exit_body = compose(p, raw["envelope"], raw["classification"], raw["dob"], raw["corner"], qualifying,
+                                layers, legends, raw["last_sale"], raw["parties"], raw["nta"], args.ask, args.listing,
+                                raw["checked"], photo, args.strategy, raw["deeds"], flood=raw["flood"])["body_md"]["comps"]
+            res["body_md"]["exit"] = exit_body.split("\n\n", 1)[0] + "\n\nClosed sales identified as renovated or new in the linked listings."
+    raw.update({"review": review, "photo": str(photo) if photo else None, "floor_plan": floor_plan,
+                "floor_plan_status": media_status, "options": {"radius": args.radius, "months": args.months,
+                "ask": args.ask, "listing": args.listing, "strategy": args.strategy}})
+    summary_keys = [{"bbl": c["bbl"], "date": c["date"]} for c in purchase[:8]]
+    if (review.get("purchase_summary") and review.get("summary_ask") == args.ask
+            and review.get("summary_purchase") == summary_keys and args.radius == 0.5 and args.months == 18):
+        table = res["body_md"]["comps"].split("\n\n", 1)[0]
+        res["body_md"]["comps"] = table + "\n\n" + review["purchase_summary"]
+    res.update({"pluto": p, "envelope": raw["envelope"], "classification": raw["classification"], "dob": raw["dob"],
+                "comps": purchase[:8], "exit_comps": exits[:8], "excluded_comps": excluded, "corner": raw["corner"],
+                "legends": legends, "checked": raw["checked"], "floor_plan": floor_plan,
+                "floor_plan_status": media_status, "snapshot": raw})
+    if not args.refresh:
+        template = out / f"{slug}-review.json"
+        if not template.exists():
+            template.write_text(json.dumps(review_template(candidates), indent=2))
+    (out / f"{slug}.json").write_text(json.dumps(res, indent=1, default=str))
+    sections = [res["body_md"]["top"]]
+    if floor_plan:
+        sections[0] = sections[0].replace("### Details", f"### Floor plan\n\n![Floor plan]({floor_plan})\n\n### Details", 1)
+    sections += ["### Area", res["body_md"]["area"], "### Purchase comps", res["body_md"]["comps"]]
+    if res["body_md"].get("exit"):
+        sections += ["### Exit comps", res["body_md"]["exit"]]
+    sections += [res["body_md"]["bottom"], f"### {NOTES_HEADING}"]
+    (out / f"{slug}.md").write_text("\n\n".join(sections))
+    say(f"wrote {out / (slug + '.md')}; {len(purchase[:8])} purchase comps, {len(exits)} renovated/new, {len(excluded)} excluded")
+    if args.notion or args.notion_refresh:
+        notion_write(res, area_png, comps_png if purchase else None, photo, refresh=args.notion_refresh or bool(args.refresh))
+    return res
 
 
 def main():
@@ -1342,6 +1655,14 @@ def main():
     ap.add_argument("--min-amt", type=float, default=100000)
     ap.add_argument("--out", default=os.environ.get("TMPDIR", "/tmp"))
     ap.add_argument("--photo", help="listing photo as a file path or URL; otherwise Street View when GOOGLE_MAPS_API_KEY is set")
+    ap.add_argument("--floor-plan", help="explicit floor-plan image path or URL; otherwise extract from the rendered listing")
+    ap.add_argument("--listing-html", help="saved rendered listing HTML (browser alternative for floor-plan extraction)")
+    ap.add_argument("--browser-url", default="http://127.0.0.1:9222", help="existing local Chrome debugging endpoint")
+    ap.add_argument("--review", help="sale-specific listing review JSON; renovated/new sales leave purchase comps")
+    ap.add_argument("--refresh", help="saved screen JSON: rebuild maps and comps with --review, without refetching city records")
+    ap.add_argument("--notion-refresh", action="store_true", help="refresh maps, comp table/relation and floor plan only; preserve hand-finished facts and notes")
+    ap.add_argument("--map-images", action="store_true", help="also render legacy map PNGs; native database maps are the default")
+    ap.add_argument("--refresh-area", action="store_true", help="fetch neighborhood layers and Google Places again; otherwise reuse the shared directory")
     ap.add_argument("--strategy", choices=["Flip", "Rent", "Build"], help="Noah's strategy word; inferred only when exactly one fits")
     ap.add_argument("--notion", action="store_true")
     ap.add_argument("--check", action="store_true", help="print the Python version, which optional packages are present and whether the Notion token is set, then exit")
@@ -1349,7 +1670,25 @@ def main():
     if args.check:
         tok = bool(os.environ.get("NOTION_TOKEN") or os.environ.get("NOTION_API_TOKEN"))
         print(f"python {sys.version.split()[0]} · requests {requests.__version__} · maps {'yes' if have_maps() else 'no (pip install matplotlib pillow)'} · "
-              f"Notion token {'set' if tok else 'missing (export NOTION_TOKEN)'} · Google key {'set' if os.environ.get('GOOGLE_MAPS_API_KEY') else 'not set (optional)'}")
+              f"Notion token {'set' if tok else 'missing (export NOTION_TOKEN)'} · Places key {'set' if os.environ.get('GOOGLE_PLACES_API_KEY') or os.environ.get('GOOGLE_MAPS_API_KEY') else 'not set (optional)'} · "
+              f"Street View key {'set' if os.environ.get('GOOGLE_MAPS_API_KEY') else 'not set (optional)'}")
+        return
+    if args.refresh:
+        raw = json.loads(Path(args.refresh).read_text())["snapshot"]
+        if args.address or args.bbl:
+            ap.error("--refresh uses the saved property; omit the address and --bbl")
+        for key in ("radius", "months"):
+            if "--" + key in sys.argv and getattr(args, key) != raw["options"][key]:
+                ap.error(f"Changing --{key} needs a fresh screen, not --refresh")
+        for key, value in raw["options"].items():
+            option = "--" + key.replace("_", "-")
+            if option not in sys.argv and not any(a.startswith(option + "=") for a in sys.argv):
+                setattr(args, key, value)
+        RADIUS_NOTE = f"{args.radius:g} mi and {args.months} months"
+        RADIUS_MI = args.radius
+        if not args.refresh_area and (ROOT / "data" / "amenities.json").exists():
+            raw["layers"] = shared_area_layers(raw["pluto"], args.radius, args.notion or args.notion_refresh)
+        write_screen(raw, args)
         return
     if not args.bbl and not args.address:
         ap.error("give an address (with --borough) or --bbl")
@@ -1363,6 +1702,10 @@ def main():
     if not p:
         sys.exit("no PLUTO record found")
     p["bbl"] = norm_bbl(p["bbl"])
+    saved_review = ROOT / "data" / "reviews" / f"{p['bbl']}.json"
+    if not args.review and saved_review.is_file():
+        args.review = str(saved_review)
+        say(f"using saved comp review for BBL {p['bbl']}")
     say(f"PLUTO {p.get('version')}: {p['address']} BBL {p['bbl']} {p.get('zonedist1')} lot {p.get('lotfront')}x{p.get('lotdepth')} class {p.get('bldgclass')}")
     boro, block, lot = BORO_CODE[p["borough"]], str(int(p["block"])), str(int(p["lot"]))
 
@@ -1386,31 +1729,14 @@ def main():
     comps = find_comps(p, env, cls, args.radius, args.months, args.min_amt)
     say(f"comps: {len(comps)} closed {comps[0]['product'] if comps else ''} sales within {args.radius} mi / {args.months} mo; checking DOB alteration jobs on the {min(len(comps), 8)} shown")
     renovation_signal(comps[:8])
-    say("maps: neighborhood outlines, stations, parks, tiles, two maps")
-    layers = area_layers(p, args.radius)
+    say("area: refreshing sources" if args.refresh_area else "area: reusing the shared place directory")
+    layers = area_layers(p, args.radius) if args.refresh_area else shared_area_layers(p, args.radius, args.notion or args.notion_refresh)
     nta = next((n["ntaname"] for n in layers["ntas"] if contains(n["the_geom"], lon, lat)), None)
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
-    slug = re.sub(r"[^a-z0-9]+", "-", p["address"].lower()).strip("-")
-    area_png: Path | None = out / f"{slug}-area.png"
-    comps_png: Path | None = out / f"{slug}-comps.png"
-    if have_maps():
-        legends = {"area": render_area_map(p, layers, args.radius, area_png, checked)}
-        legends["comps"] = render_comps_map(p, comps[:8], layers["ntas"], args.radius, comps_png, checked) if comps else []
-    else:
-        print("maps skipped: matplotlib and pillow are not installed (pip install matplotlib pillow); the pin list is still written")
-        legends = {"area": [(kind, line) for kind, line, _, _ in area_items(p, layers)], "comps": []}
-        area_png = comps_png = None
-    photo = fetch_photo(args.photo, p, out / f"{slug}-photo.jpg")
-    res = compose(p, env, cls, dob, corner, comps, layers, legends, last_sale, parties, nta, args.ask, args.listing, checked, photo, args.strategy, deeds, flood=flood)
-    res.update({"pluto": p, "envelope": env, "classification": cls, "dob": {k: v for k, v in dob.items() if k not in ("bis_jobs", "dobnow_jobs", "active_dobnow")} | {"bis_jobs": dob["bis_jobs"][:5], "dobnow_jobs": dob["dobnow_jobs"][:5]},
-                "comps": comps[:8], "corner": corner, "legends": legends, "checked": checked})
-    (out / f"{slug}.json").write_text(json.dumps(res, indent=1, default=str))
-    (out / f"{slug}.md").write_text("\n\n".join([res["body_md"]["top"], "### Area", res["body_md"]["area"], "### Purchase comps", res["body_md"]["comps"], res["body_md"]["bottom"], f"### {NOTES_HEADING}"]))
-    say(f"wrote {out / f'{slug}.md'} {area_png} {comps_png if comps else '(no comps map)'} {photo or '(no photo)'}")
-    if args.notion:
-        res["dob"] = dob
-        notion_write(res, area_png, comps_png if comps else None, photo)
+    raw = {"pluto": p, "envelope": env, "classification": cls, "dob": dob, "corner": corner,
+           "candidate_comps": comps, "layers": layers, "last_sale": last_sale, "parties": parties,
+           "nta": nta, "checked": checked, "deeds": deeds, "flood": flood}
+    write_screen(raw, args)
+    say("screen complete")
 
 
 if __name__ == "__main__":

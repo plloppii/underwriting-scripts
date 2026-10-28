@@ -2,7 +2,7 @@
 """Create the Properties database under the Real Estate page, migrate it to the current schema and backfill derived fields
 (idempotent; ids stored in data/notion_state.json under databases.deals, kept under that key for the scripts that use it).
 
-History: 2026-10-15 created Deals + Comps; 2026-10-16 merged them into one Properties database (one row per building, Role
+History: 2026-10-15 created Deals + Comps; 2026-10-16 merged them into one Properties database (one row per building, Type
 Deal or Comp) and trashed Comps; 2026-10-17 trimmed nine fields the page already carries (Lot became text); 2026-10-21 Rules that mattered became text
 (the Notion mirror of the Zoning Resolution was retired; zoning text comes from the nyc-zr CLI). Env: NOTION_TOKEN or NOTION_API_TOKEN; NOTION_UW_PARENT overrides the parent page id.
 """
@@ -16,16 +16,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
-from notion_api import load_state, page_url, req, rt, save_state  # noqa: E402
+from notion_api import load_state, location_value, page_url, req, rt, save_state  # noqa: E402
 
 PARENT = os.environ.get("NOTION_UW_PARENT", "60a139f3-f569-40cf-9976-8d0c40dae1c5")  # "Real Estate"
 V = "2022-06-28"
 TITLE = "Properties"
-DESCRIPTION = ("One row per building, keyed by BBL. Role says whether it is a deal Noah is looking at or a comp that supported one; "
-               "a comp becomes a deal by changing Role. Filled by scripts/screen.py and by the agent following docs/PLAYBOOK.md in the "
-               "notion-underwriting repository on GitHub. Only Noah sets \"Noah's call\".")
+DESCRIPTION = ("Properties and nearby places in one database. Type is Deal, Comp, Restaurant, Park or Subway station. "
+               "Property records are keyed by BBL; amenities use Source ID. Location powers native map views. "
+               "Only Noah sets \"Noah's call\".")
 
 STRATEGIES = ("Flip", "Rent", "Build", "Not set")
+TYPES = ("Deal", "Comp", "Restaurant", "Park", "Subway station")
 FLAGS = ("Historic district", "Landmark", "Shallow lot", "Near corner", "Narrow lot", "Irregular lot", "Rent regulated?",
          "Open DOB violations", "Open HPD violations", "Active DOB job", "Flood zone", "City owned", "Litigation", "No rent history")
 
@@ -46,7 +47,10 @@ def num(fmt="number"):
 SCHEMA = {
     "Name": {"title": {}},
     "BBL": {"rich_text": {}},
-    "Role": sel("Deal", "Comp"),
+    "Type": sel(*TYPES),
+    "Location": {"place": {}},
+    "Source ID": {"rich_text": {}},
+    "Source URL": {"url": {}},
     "Strategy": sel(*STRATEGIES),
     "Borough": sel("Manhattan", "Bronx", "Brooklyn", "Queens", "Staten Island"),
     "Neighborhood": {"select": {"options": []}},
@@ -134,6 +138,9 @@ def migrate(state: dict, db_id: str) -> None:
     """Bring the database to the current schema: title, new fields, formulas, self-relation, dropped fields (idempotent)."""
     d = req("GET", f"/databases/{db_id}", version=V)
     props = d["properties"]
+    if "Role" in props and "Type" not in props:
+        _patch(db_id, {props["Role"]["id"]: {"name": "Type"}}, "Role -> Type (same property ID)")
+        props = req("GET", f"/databases/{db_id}", version=V)["properties"]
     if "".join(t["plain_text"] for t in d["title"]) != TITLE:
         req("PATCH", f"/databases/{db_id}", {"title": rt(TITLE), "description": rt(DESCRIPTION), "icon": {"type": "emoji", "emoji": "🏘️"}}, version=V)
         print(f"properties: renamed to {TITLE!r}")
@@ -141,7 +148,7 @@ def migrate(state: dict, db_id: str) -> None:
     _patch(db_id, {k: v for k, v in SCHEMA.items() if k not in props and k != "Name"}, "added")
     # Verdict / Strategy / Flags option sets (add missing options; Notion ignores renames by id)
     opt_patch = {}
-    for name, wanted in (("Strategy", STRATEGIES), ("Flags", FLAGS), ("Role", ("Deal", "Comp"))):
+    for name, wanted in (("Strategy", STRATEGIES), ("Flags", FLAGS), ("Type", TYPES)):
         cur = props.get(name)
         if cur:
             kind = cur["type"]
@@ -212,7 +219,7 @@ def pluto_rows(bbls: set[str]) -> dict[str, dict]:
         return {}
     rows = soda(DS["pluto"], {"$where": "bbl in (" + ",".join(sorted(bbls)) + ")",
                               "$select": "bbl,address,borough,zonedist1,zonedist2,overlay1,spdist1,lotarea,lotfront,lotdepth,lottype,irrlotcode,"
-                                         "bldgclass,yearbuilt,numfloors,unitsres,bldgarea,bldgfront,bldgdepth,residfar,ownername,histdist,landmark"})
+                                         "bldgclass,yearbuilt,numfloors,unitsres,bldgarea,bldgfront,bldgdepth,residfar,ownername,histdist,landmark,latitude,longitude"})
     return {norm_bbl(r["bbl"]): r for r in rows}
 
 
@@ -233,6 +240,9 @@ def props_from_pluto(p: dict) -> dict:
         "Building": _rt(building_text(p)),
         "Owner": _rt((p.get("ownername") or "").title()[:200]),
     }
+    location = location_value((p.get("address") or "").title(), p.get("latitude"), p.get("longitude"))
+    if location:
+        out["Location"] = location
     return out
 
 
@@ -244,7 +254,7 @@ def _month(d: str) -> str:
 
 
 def merge_comps(state: dict, db_id: str) -> None:
-    """Move every row of the old Comps database into Properties as Role Comp (one row per BBL, latest sale on the row,
+    """Move every row of the old Comps database into Properties as Type Comp (one row per BBL, latest sale on the row,
     earlier sale in Prior sale), relink the deals through 'Comps used', then trash the old database. Idempotent."""
     comps_db = state["databases"].get("comps")
     if not comps_db:
@@ -282,7 +292,7 @@ def merge_comps(state: dict, db_id: str) -> None:
             props.update({
                 "Name": {"title": [{"type": "text", "text": {"content": _text(last["Name"]) or (p.get("address") or bbl).title()}}]},
                 "BBL": {"rich_text": [{"type": "text", "text": {"content": bbl}}]},
-                "Role": {"select": {"name": "Comp"}},
+                "Type": {"select": {"name": "Comp"}},
                 "Strategy": {"select": {"name": "Not set"}},
                 "Neighborhood": {"select": {"name": last["Neighborhood"]["select"]["name"]}} if last.get("Neighborhood", {}).get("select") else {"select": None},
                 "Last sale price": {"number": last["Price"]["number"]},
@@ -316,16 +326,17 @@ def merge_comps(state: dict, db_id: str) -> None:
 
 
 def backfill(db_id: str) -> None:
-    """Role/Strategy defaults, Last sale price/date from the old text, lot and building fields from PLUTO (idempotent)."""
+    """Type/Strategy defaults, Last sale price/date from the old text, lot and building fields from PLUTO (idempotent)."""
     from screen import fnum, norm_bbl
     rows = _rows(db_id)
-    bbls = {norm_bbl(_text(r["properties"].get("BBL"))): r for r in rows if _text(r["properties"].get("BBL"))}
+    bbls = {norm_bbl(_text(r["properties"].get("BBL"))): r for r in rows if _text(r["properties"].get("BBL"))
+            and (r["properties"].get("Type", {}).get("select") or {}).get("name") in (None, "Deal", "Comp")}
     pluto = pluto_rows(set(bbls))
     for bbl, r in bbls.items():
         pr = r["properties"]
         patch: dict = {}
-        if not pr.get("Role", {}).get("select"):
-            patch["Role"] = {"select": {"name": "Comp" if pr.get("Last sale price", {}).get("number") and not pr.get("Ask", {}).get("number") and not pr.get("Verdict", {}).get("select") else "Deal"}}
+        if not pr.get("Type", {}).get("select"):
+            patch["Type"] = {"select": {"name": "Comp" if pr.get("Last sale price", {}).get("number") and not pr.get("Ask", {}).get("number") and not pr.get("Verdict", {}).get("select") else "Deal"}}
         if not pr.get("Strategy", {}).get("select"):
             patch["Strategy"] = {"select": {"name": "Not set"}}
         old = _text(pr.get("Last sale"))
@@ -344,6 +355,8 @@ def backfill(db_id: str) -> None:
             for k in ("Building", "Lot"):
                 if want[k]["rich_text"] and _text(pr.get(k)) != want[k]["rich_text"][0]["text"]["content"]:
                     patch[k] = want[k]
+            if want.get("Location") and not pr.get("Location", {}).get("place"):
+                patch["Location"] = want["Location"]
         if patch:
             req("PATCH", f"/pages/{r['id']}", {"properties": patch}, version=V)
             print("properties: backfilled", _text(pr["Name"]), sorted(patch))
@@ -356,7 +369,7 @@ def main():
     state["databases"]["properties"] = db
     save_state(state)
     migrate(state, db)       # adds the new fields (drop list only removes fields no longer holding needed data)
-    backfill(db)             # carries Last sale text into price/date, Role/Strategy defaults, PLUTO fields
+    backfill(db)             # carries Last sale text into price/date, Type/Strategy defaults, PLUTO fields
     merge_comps(state, db)   # old Comps rows -> Comp rows, relink, trash old database
     d = req("GET", f"/databases/{db}", version=V)["properties"]
     stale = {k: None for k in ("Last sale", "Comps") if k in d}

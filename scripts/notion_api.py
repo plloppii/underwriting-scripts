@@ -7,6 +7,7 @@ data/notion_state.json. Copied from the nyc-zr zoning mirror's helpers on 2026-1
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -48,6 +49,10 @@ def req(method: str, path: str, body=None, version="2025-09-03"):
         if r.status_code == 429:
             time.sleep(float(r.headers.get("Retry-After", "2")))
             continue
+        if r.status_code in (500, 502, 503, 504) and method.upper() in ("GET", "PATCH") and attempt < 5:
+            print(f"  retry ({r.status_code})", file=sys.stderr)
+            time.sleep(min(2 ** attempt, 16))
+            continue
         if r.status_code >= 400:
             raise RuntimeError(f"{method} {path} -> {r.status_code}: {r.text[:500]}")
         return r.json()
@@ -65,6 +70,20 @@ def save_state(state: dict) -> None:
 
 def page_url(page_id: str) -> str:
     return "https://www.notion.so/" + page_id.replace("-", "")
+
+
+def location_value(name, lat, lon, address=None):
+    """A native Place value, or None when coordinates are unknown or invalid."""
+    try:
+        lat, lon = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    place = {"lat": lat, "lon": lon, "name": name}
+    if address:
+        place["address"] = address
+    return {"place": place}
 
 
 # ----------------------------------------------------------------------------- markdown -> blocks

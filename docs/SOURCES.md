@@ -10,13 +10,14 @@ All calls are `GET https://data.cityofnewyork.us/resource/<dataset>.json` with S
 | --- | --- | --- | --- |
 | BBL, block, lot, lat/long, lot front and depth, lot area, lot type; zoning district, overlay, special district; historic district, landmark; building class, year, floors, units, gross area, built FAR; residential FAR; E-designation | PLUTO `64uk-42ks` | `$where=upper(address)='63 IRVING PLACE' AND borough='BK'` or `$where=bbl=3019840005`. lottype 3 corner, 4 through, 5 interior; irrlotcode; zonedist1-4, overlay1-2, spdist1-3, splitzone; histdist and landmark absent when none; bldgclass, yearbuilt, numfloors, unitsres, unitstotal, bldgarea (DOF gross area, its own basis), builtfar, residfar; edesignum present only with an E-designation (hazardous materials, air or noise conditions to clear before new construction) | `pluto_by_address`, `pluto_by_bbl` |
 | Owner, deeds, prices, parties | ACRIS legals `8h5j-fqxa`, master `bnx9-e6tj`, parties `636b-3b5g` | Legals `$where=borough='3' AND block='1984' AND lot='5'` gives document_id values; master `$where=document_id in ('id1','id2') AND doc_type='DEED'` gives document_date and document_amt; parties by document_id, party_type 1 seller, 2 buyer. document_amt under 100000 is not a market sale | `acris_deeds`, `acris_parties` |
-| BIN | PAD `bc8t-ecyu` by bbl, or any DOB record below | | `dob_facts` |
+| BIN | DOB/HPD records below, then NYC building-footprint centroids `u9wf-3gbt` | `$where=base_bbl='3010100021'&$select=bin,base_bbl`; reject unassigned borough-only BINs such as 3000000. PAD `bc8t-ecyu` is a downloadable ZIP, not a queryable SoQL table | `dob_facts` |
 | DOB and ECB violations | DOB `3h2n-5cm9`, ECB `6bgk-3dad` | DOB `$where=boro='3' AND block='01984' AND lot='00005'` (block 5 digits, lot 5 digits); ECB the same with the lot 4 digits. Open versus dismissed from violation_category and ecb_violation_status; sum balance_due | `dob_facts` |
 | DOB jobs, both systems | BIS jobs `ic3t-wcy2`, DOB NOW `w9ak-ipjd` | `$where=bbl='3019840005'`. BIS: job__, job_type (NB, A1, A2, A3, DM), job_status_descrp, pre__filing_date, proposed_dwelling_units, proposed_zoning_sqft. DOB NOW: job_filing_number, job_type, filing_status, filing_date, approved_date, signoff_date, proposed_dwelling_units, total_construction_floor_area | `dob_facts` |
 | Renovation signal on a comp | the same two datasets, by the comp's bbl | BIS `job_type in ('A1','A2')`, DOB NOW `job_type like 'Alteration%'`; a job filed between 36 months and 6 months before the deed, not withdrawn or expired, means the seller did permitted work before selling. Fills the comps table's Listing column as "renovation signal: Alteration job filed May 2024, letter of completion issued" for the listing pass to confirm; unpermitted work leaves no signal | `renovation_signal` |
 | HPD violations and registration | HPD violations `wvxf-dwi5`; Multiple Dwelling Registrations `tesw-yqqr` | `$where=bbl='3019840005' AND violationstatus='Open'`, count by class A, B, C. A registrationid on a violation, or a row in `tesw-yqqr` by block and lot (lastregistrationdate, registrationenddate), means the building is registered | `dob_facts` (violations) |
 | Neighborhood name and outlines | NTA 2020 `9nt8-h7nd` | `$where=intersects(the_geom, 'POLYGON((lon lat, ...))')`; ntaname, the_geom | `nta_polygons` |
 | Parks | `enfh-gkve` | `$where=intersects(multipolygon, 'POLYGON((...))') AND typecategory in (...)`; signname, typecategory, acres, multipolygon | `area_layers` |
+| Shared restaurant identities and coordinates | DOHMH inspection records `43nn-pn8j` | Match existing area names to dba and nearby coordinates; dedupe by camis. Keep public business name, address, latitude and longitude. Ambiguous matches remain unresolved; no Google ratings are copied | `map_database.discover_amenities` |
 | Comp candidates | PLUTO, then ACRIS | PLUTO `$where=latitude between 40.676 and 40.690 AND longitude between -73.968 and -73.950 AND bldgclass like 'V%'` for land, `'A%'`, `'B%'`, `'C%'` for houses and walk-ups. Legals one query per candidate block (`block='3424' AND lot in (...)`), six queries in flight at once; master with `doc_type='DEED' AND document_date >= ... AND document_amt > 100000`; join back by block and lot for area and class. A half-mile search touches about 130 blocks and takes under a minute | `find_comps`, `acris_deeds` |
 | Assessed value, exemptions, tax class | Property Valuation and Assessment Data `yjxr-fw8i` | by bble (BBL); fullval, avtot, extot, exmptcl, taxclass, owner. The tax bill itself is not here (see Browser only) | not in the script |
 
@@ -34,16 +35,29 @@ Flood results on the page: effective SFHA_TF T gives the Flood row ("zone AE, hi
 
 ## Google, with the key
 
-The Google Maps Platform key is restricted to the Street View Static API and Places API (New) and quota-capped. The script reads it from `GOOGLE_MAPS_API_KEY`; where an agent keeps it is in its file under `agents/`. Never on a page, in a code block, in Run log, in Research notes or in a message. Without it the photo falls back to none and the food layer is left off the map, with a clause in the caption.
+Normal screens reuse native place records rather than calling Places. Google nearby search runs only with `--refresh-area`.
+The permanent directory uses independent city records; the live Google response is not the shared directory.
+
+The Google Maps Platform key is restricted to the Street View Static API and Places API (New) and quota-capped. The script reads it from `GOOGLE_MAPS_API_KEY`; a separate `GOOGLE_PLACES_API_KEY` takes precedence for Places only. Where an agent keeps it is in its file under `agents/`. Never on a page, in a code block, in Run log, in Research notes or in a message. Without the corresponding key the Street View photo or food layer is omitted, with a clause in the map caption for missing food.
 
 | Fact | Call | Function |
 | --- | --- | --- |
 | Street View photo, only when no listing photo exists | `GET https://maps.googleapis.com/maps/api/streetview/metadata?location=<lat>,<lon>&key=<key>`; continue only when status is OK, then `GET https://maps.googleapis.com/maps/api/streetview?size=640x400&location=<lat>,<lon>&fov=70&key=<key>` | `fetch_photo` |
-| Restaurants and cafes for the area map | `POST https://places.googleapis.com/v1/places:searchNearby`, key in the `X-Goog-Api-Key` header, includedTypes restaurant, cafe, bakery, a 800 m circle; the five best by rating weighted by review count, each line with its rating and count | `places_food` |
+| Restaurants and cafes for the area map | `POST https://places.googleapis.com/v1/places:searchNearby`, key in the `X-Goog-Api-Key` header, includedTypes restaurant, cafe, bakery, a 800 m circle; retain primary types restaurant, *_restaurant, cafe, bakery, coffee_shop or tea_house, rejecting retail stores with secondary food types; the five best by rating weighted by review count | `places_food` |
 
 ## Browser only
 
 No API exists for these. Take only what is listed.
+
+Floor-plan extraction uses the rendered listing through an existing local Chrome DevTools session (localhost:9222), or a
+saved rendered HTML file with `--listing-html`. It selects images explicitly labeled as floor plans in the DOM or structured
+media, validates the image bytes and crops separated branding bands when drawing boundaries are clear. A description merely
+mentioning a floor plan does not qualify other images. `--floor-plan` supplies a verified image directly. A blocked listing
+is recorded in local output without bypassing the block; the rest of the run continues. Visually check the extracted plan.
+
+Park distances and pins use the nearest point on the park polygon, including multipart parks and interior holes, labeled
+"mi to edge". This is a straight-line edge distance; an entrance or walking route requires separate evidence. Displaced map
+pins have leader lines to their actual coordinates, and spacing accounts for the rendered marker diameter.
 
 | Source | What to take | Notes |
 | --- | --- | --- |

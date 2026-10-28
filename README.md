@@ -10,7 +10,7 @@ live in this repository and nowhere else; the Notion pages that used to hold the
 
 ## Layout
 
-| Path | Role |
+| Path | Purpose |
 | --- | --- |
 | `AGENTS.md` | Entry point for any agent: what to read, the job in one screen, the four hard rules. |
 | `docs/PLAYBOOK.md` | The method: rules, Stages 0 to 4, what the script does versus what the agent does by hand. Agent-neutral. |
@@ -19,7 +19,8 @@ live in this repository and nowhere else; the Notion pages that used to hold the
 | `docs/NOTION.md` | The output adapter: the Properties database, its fields and payloads, page-writing rules. |
 | `docs/agents/INSTINCT.md` | Notes specific to Noah's assistant Instinct: ephemeral workspace, keys, saved routine. |
 | `scripts/bootstrap.sh` | Clone or pull this repo and nyc-zr, install the packages, print a check. Idempotent. |
-| `scripts/screen.py` | Stages 0 to 3 for one property: Open Data, flood maps, envelope, flags, ACRIS comps with a renovation signal, two maps, Notion write. |
+| `scripts/screen.py` | Property facts, flood checks, envelope, ACRIS comps, native map locations and shared nearby places; optional PNG export. |
+| `scripts/map_database.py` | Fill native property locations and import reusable city-sourced amenities by Source ID. |
 | `scripts/notion_deals.py` | Creates, migrates and backfills the Properties database. Run after schema changes only. |
 | `scripts/notion_api.py` | Shared Notion helpers: paced requests, markdown to blocks, state file. |
 | `data/notion_state.json` | Database ids, and the ids of the archived instruction pages. |
@@ -37,13 +38,47 @@ export GOOGLE_MAPS_API_KEY=...            # optional: Street View photo, restaur
 python3 scripts/screen.py --check
 ```
 
+The screen also reads these integration settings from the repo's gitignored `.env` file; exported environment values win.
+`GOOGLE_PLACES_API_KEY` is accepted for Places and takes precedence there; `GOOGLE_MAPS_API_KEY` is the fallback for Places
+and the key used for Street View.
+
 ## Commands
 
+The database now holds deals, comps and amenities together, with one **Type** field and native **Location** pins. Role was
+renamed in place; the original records and relationships are retained. Use the Deals map, Comps map and Neighborhood map tabs.
+Normal screens reuse shared place records and skip Google Places searches and PNG rendering. Use `--refresh-area` to fetch
+area sources again, or `--map-images` for a legacy image export. `data/amenities.json` is the portable, city-sourced directory;
+Google ratings are not stored in that directory. `scripts/map_database.py` fills existing property locations and imports
+amenities by their stable Source ID.
+
 ```sh
-python3 scripts/screen.py "63 Irving Place" --borough BK --ask 499999 --strategy Build --listing <url> --out $TMPDIR/irving   # dry run: .md, .json, two maps
+python3 scripts/screen.py "63 Irving Place" --borough BK --ask 499999 --strategy Build --listing <url> --out $TMPDIR/irving   # local .md and .json
 python3 scripts/screen.py --bbl 3019840005 --ask 499999 --strategy Build --notion                                            # write the row, comp rows and page body
 python3 scripts/notion_deals.py                                                                                               # bring the database to the current schema
 ```
+
+Listing floor plans are read automatically from a rendered listing when Chrome is already running with remote debugging
+on localhost:9222. The script uses its own tab and closes it afterward. With no browser, or a blocked listing, use
+`--listing-html <saved-rendered.html>` or `--floor-plan <image path or URL>`. Pillow validates and crops the image before upload.
+The rest of the screen runs when browser support is unavailable.
+
+Each run also saves the full API snapshot and a `<address>-review.json` template. After the listing pass, save decisions in
+`data/reviews/<BBL>.json` (automatically loaded on fresh runs), or pass another file with `--review`. Each decision is keyed
+by BBL **and sale date**, with a source URL and evidence; `renovated` and `new` leave purchase comps, and `exclude` drops an
+unsuitable sale. `unknown` stays unknown. Set `include_unreviewed` to false to retain only the sales covered by the review
+instead of filling the table with additional unreviewed candidates. A DOB alteration signal alone never proves condition.
+
+```sh
+python3 scripts/screen.py --refresh /tmp/irving/63-irving-place.json --review data/reviews/3019840005.json --out /tmp/irving-reviewed
+python3 scripts/screen.py --refresh /tmp/irving/63-irving-place.json --review data/reviews/3019840005.json --out /tmp/irving-reviewed --notion
+```
+
+Refresh reuses the saved public records and updates the table and map together. With `--notion`, it replaces Area, Purchase
+comps, applicable Exit comps and the floor plan, updates the comp relation, and appends a Run log line. Existing listing
+facts, taxes, photo, verdict paragraph, rents, and Noah's notes remain intact. `--notion-refresh` selects that same limited
+Notion update after a fresh API run. Ordinary fresh `--notion` still rebuilds everything above Noah's notes.
+
+Run the regression checks with `python3 -m unittest discover -s tests -v`.
 
 Notion, under Noah's "Real Estate" page: the Properties database is https://www.notion.so/3fa9d8ce4a74811595f5c286b2ef5beb.
 
@@ -58,15 +93,16 @@ map with a color-matched pin list, a rents table from StreetEasy history, purcha
 exit comps only with a strategy, open items, a run log, a Research notes toggle and a "Noah's notes" heading that nothing
 automated edits. Returns, costs and price ladders are deliberately absent: Noah has no cost basis yet.
 
-The Properties database has one row per building, keyed by BBL. Role is Deal or Comp, and a comp becomes a deal by changing
-Role. The latest deed sits on the row as Last sale price and date with the one before in Prior sale; a deal links its comps
+The Properties database has one row per property or nearby place. Property types are Deal and Comp; amenity types are
+Restaurant, Park and Subway station. Properties use BBL and amenities use Source ID. Every located record has a native
+Location value. The latest deed sits on property rows as Last sale price and date with the one before in Prior sale; a deal links its comps
 through Comps used and names the ZR sections it cited in Rules that mattered. The row holds only what is not already on the
-page; 27 fields as of 2026-10-17.
+page; current fields and their ownership are listed in `docs/NOTION.md`.
 
 `screen.py` pulls PLUTO, ACRIS deeds and parties, DOB and ECB violations, BIS and DOB NOW jobs and HPD violations, and the
 flood zone from FEMA's effective maps and the city's copy of the 2015 preliminary maps (both ArcGIS REST, no key); computes
 max zoning floor area and lot flags; finds closed same-class sales within a radius and window (six ACRIS queries at a time)
-and marks the ones with DOB alteration jobs filed before the sale as a renovation signal for the listing pass; renders both maps on
-OpenStreetMap tiles (cached in `.cache/tiles`) with neighborhood outlines, a dashed half-mile frame, a red star and numbered
-pins in three color groups and no text in the image; uploads the images through the Notion file-upload API; and writes the
+and marks the ones with DOB alteration jobs filed before the sale as a renovation signal for the listing pass; reuses the shared
+area directory and writes native Location values for interactive database maps. `--map-images` explicitly renders legacy
+OpenStreetMap PNGs; supplied listing images use the Notion file-upload API. The screen writes the
 deal row, comp rows and page body above "Noah's notes". It never writes Pursue.

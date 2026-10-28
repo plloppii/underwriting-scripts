@@ -5,6 +5,7 @@ description = "Noah's NYC property underwriting system: the agent playbook and p
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.31",
+    "websocket-client>=1.8",  # Chrome DevTools for rendered listing media
     "matplotlib>=3.7",   # maps; optional at runtime, the script runs without it
     "pillow>=10",        # maps; optional at runtime
 ]

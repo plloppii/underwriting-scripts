@@ -20,18 +20,24 @@ The method for one property. Read it from your checkout at the start of every jo
 
 **Trigger.** Noah sends an address and borough, usually a strategy word (Flip, Rent, Build), the asking price and a listing link. When he sends only the address, find the live listing yourself first (section 2) and take the ask from it. One property per job. A later message about the same property re-runs only the stages it touches.
 
-**Dedupe.** The screen resolves the BBL and finds the row by BBL in the Properties database (`NOTION.md`). A Comp row becomes the deal: Role set to Deal, page filled the rest of the way. A Deal row is updated in place above "Noah's notes", with a line added to its Run log. No row: one is created. Never a second row for the same BBL.
+**Dedupe.** The screen resolves the BBL and finds the row by BBL in the Properties database (`NOTION.md`). A Comp row becomes the deal: Type set to Deal, page filled the rest of the way. A Deal row is updated in place above "Noah's notes", with a line added to its Run log. No row: one is created. Never a second row for the same BBL.
 
 **Scope.** Stages 0 to 3 and the top paragraph on every job. Exit comps, and the rents work that depends on a strategy, run only when Strategy is set. Nothing about returns, costs or price ladders.
 
 **The script does the API half.** Run `scripts/screen.py` first with Noah's ask, strategy and listing link and `--notion`, then do the rest by hand. On a re-run the script rebuilds everything above "Noah's notes", so what you added by hand is gone and must be added again: re-run it only when the facts or comps need refreshing, otherwise edit the page directly.
+
+For an already finished page, use `--notion-refresh` on a fresh screen to update maps, comp tables and relations, and the
+floor plan while preserving listing facts, taxes, photo, rents, the opening paragraph and Noah's notes. For a comp-only
+change, use `--refresh <saved-screen.json> --review <review.json> --notion`; city records are reused and retain their original
+checked date. Both limited updates require the existing section headings and Noah's notes boundary. Ordinary fresh
+`--notion` remains a full rebuild.
 
 | Stage | The script | You, by hand |
 | --- | --- | --- |
 | 0 Identify | Twelve facts from PLUTO, ACRIS, DOB, ECB, HPD and the two flood maps; the links line; the Details rows; the flags; the Flood row and the E-designation | The listing's facts (ask, marketed area, beds and baths, days on market, stated taxes and rents); the photo and floor plan; the tax bill row from the DOF portal; HPD registration and I-cards when the unit count is in question |
 | 1 Envelope | Max zoning floor area, unused rights, the Zoning entries for near-corner, shallow, narrow, irregular and historic lots, cited by official URL | Any other lot-specific rule, read with the zr tool |
 | 2 Classify | The three classifiers, strategy inference, the verdict and a draft top paragraph | Sentences 1 and 3 of the top paragraph, rewritten once you know the listing and the rents |
-| 3 Area and comps | Area map and pin list; purchase comps from ACRIS with the comps map, the Listing column pre-filled where DOB alteration jobs signal a renovation; one Comp row per comp building | The listing pass on each comp (the Listing column; Beds/baths and Listing URL on the comp row), moving renovated sales to exit comps; the Rents table; exit comps |
+| 3 Area and comps | Native map locations and shared nearby-place list; ACRIS purchase comps, with the Listing column pre-filled where DOB jobs signal renovation; one Comp row per comp building | The listing pass (Listing column, Beds/baths and Listing URL), moving renovated sales to exit comps; Rents; exit comps |
 | 4 Close | A draft Open items table, the row fields, a Run log line | The final open items; Rules that mattered for anything you cited; your own Run log line |
 
 ## 2. Stage 0: Identify
@@ -98,7 +104,14 @@ Without Noah's word: a vacant lot is Build; an occupied building with regulated 
 
 **Listing pass**, once per closed comp, up to the eight on the page: find the sold listing on Redfin first, then Zillow, then Compass. Beds and baths and the listing URL go on the comp's row; list price and days on market go only in the table's Listing column as "$1.25M list · 41 days · [link]". Nothing on any of the three: "not listed", which usually means an off-market sale. A Listing cell the script filled with "renovation signal: …" means DOB alteration jobs were filed in the three years before the sale and at least six months ahead of it: check that comp first, and when its listing said renovated, gut renovated or new, move the sale to exit comps and drop it from the purchase table and the comps map. The signal misses work done without permits, so the pass still covers every comp; replace the signal text with the listing facts once you have them. One lookup per comp, a few seconds apart. A comp row that already has a Listing URL was found in an earlier job: open that URL instead of searching again. If a site rate-limits you, stop using it for the rest of the job and say so in the Run log line.
 
-**Comp rows.** Every comp is a row with Role Comp, one per building, keyed by BBL (`NOTION.md`). The latest sale is Last sale price and date; the one before is Prior sale. Two sales within three years are a renovation pair; name it in the sentence under the table. A comp's page is the light template: photo from the sold listing, links line, one or two sentences, a Details table of at most five rows, Rents if StreetEasy has history, and the Noah's notes heading. A tracked deal that later records a deed is the same row: Last sale filled, Verdict set to Closed by others.
+Persist the listing pass in `data/reviews/<BBL>.json`, or pass a file with `--review`; each sale needs its BBL and closing
+date, condition (`unknown`, `as_is`, `renovated`, `new`, `exclude`), listing URL and supporting evidence. Keep unknown values
+null. The screen saves a review template beside its JSON output and automatically loads an existing BBL review on future
+fresh runs. `renovated` and `new` cannot reappear as purchase comps; they produce an exit table only when the strategy and
+evidence allow one. `include_unreviewed: false` keeps the reviewed selection without adding unreviewed replacements.
+Refresh the saved screen after updating the file so table order, map numbers and comp relations agree.
+
+**Comp rows.** Every comp is a row with Type Comp, one per building, keyed by BBL (`NOTION.md`). The latest sale is Last sale price and date; the one before is Prior sale. Two sales within three years are a renovation pair; name it in the sentence under the table. A comp's page is the light template: photo from the sold listing, links line, one or two sentences, a Details table of at most five rows, Rents if StreetEasy has history, and the Noah's notes heading. A tracked deal that later records a deed is the same row: Last sale filled, Verdict set to Closed by others.
 
 **Sentence under the table.** Name the best analogs (same district, one-third to three times the subject's size) against the ask, and any lot that sold twice. No implied-value range.
 
@@ -106,7 +119,13 @@ Without Noah's word: a vacant lot is Build; an occupied building with regulated 
 
 **Rents**, whenever the building has units: asking rents from StreetEasy's listing history, one row per unit (Unit, Beds/baths, Last asking rent, Listed as month and year, a "unit page" or "building page" link). These are asking rents from past listings, not a rent roll; actual rents stay an open item resolved by leases. No history: the section is absent and the row's Flags gets "No rent history".
 
-**Maps.** The script draws both: OpenStreetMap tiles cropped to a square a mile on a side centered on the subject, the city's 2020 neighborhood outlines, a dashed frame, a red star, numbered pins in three color groups (trains blue, the five best-rated restaurants and cafes red, the one or two largest parks green), and no text in the image. Under the area map, in this order: one caption line naming the sources and the checked date, the pin list as numbered blocks colored to match their pins, and one sentence only for a negative (historic district or flood zone). Nothing about development pace. The comps map numbers the comps in table order, filled for closed sales, hollow for listings; the table is its legend. If you ever draw a map yourself, the script's layers and style are the reference.
+**Maps and reusable area data.** Use the native Notion map views of Properties. Each record has Type and Location; properties
+and nearby restaurants, parks and subway stations share the database. Normal runs reuse the shared place directory and do
+not repeat Google Places searches or render map images. In local dry runs the portable directory is `data/amenities.json`;
+Notion writes read the current place records from the database. The Area section carries a map link, sources and distances.
+Restaurant entries are directory facts, without copied Google ratings. Park distances remain to the nearest polygon edge.
+An area with missing coverage is Unknown; refresh it explicitly with `--refresh-area` when needed. `--map-images` is an explicit
+legacy export. The source geometry and the old image style remain available in the script for that export.
 
 ## 6. Stage 4: Close
 

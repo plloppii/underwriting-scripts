@@ -1,6 +1,6 @@
 # Handoff: Noah's NYC underwriting system
 
-Last updated 2026-10-21. Audience: an agent or person taking over maintenance. Noah Pan is the owner; he is new to real-estate
+Last updated 2026-10-28. Audience: an agent or person taking over maintenance. Noah Pan is the owner; he is new to real-estate
 jargon, so everything he reads must be plain sentences, and he decides pursue or pass himself.
 
 ## What it does
@@ -16,13 +16,13 @@ searchable index and a CLI; pages here cite its sections by official URL, and no
 This repo, `~/notion-underwriting` (github.com/plloppii/notion-underwriting, private; Instinct has read access and clones it;
 `.venv/`, `.cache/` are local):
 
-| Path | Role |
+| Path | Purpose |
 | --- | --- |
 | `AGENTS.md` | Entry point for any agent: reading order, the job in one screen, the four hard rules. |
 | `docs/PLAYBOOK.md` | The method, agent-neutral. Section 1 has the division of labor between the script and the agent. |
 | `docs/TEMPLATE.md` | Deal page and comp page shapes, with the budgets table at the end. |
 | `docs/SOURCES.md` | Every data source with its API recipe, the browser-only few, link patterns. |
-| `docs/NOTION.md` | The Properties database (27 fields, payloads) and the page-writing rules. The only Notion-specific document. |
+| `docs/NOTION.md` | The shared Properties database, fields, native map views, payloads and page-writing rules. |
 | `docs/agents/INSTINCT.md` | What is specific to Instinct: ephemeral workspace, Python 3.10, vault key, saved routine rents-for-address. A new agent gets its own file here. |
 | `scripts/bootstrap.sh` | Clone or pull both repos under `$UW_HOME` (default `$HOME`), pip install, `screen.py --check`, zr tool check. Idempotent. |
 | `scripts/screen.py` | Stages 0 to 3: Open Data pulls, flood zone from two map services, envelope, flags, ACRIS comps with a renovation signal from DOB jobs, two maps, Notion write. Progress lines with elapsed seconds. Python 3.10+. |
@@ -66,10 +66,9 @@ Definitions databases and "README for agents" (`3f99d8ce-4a74-8153-9aab-c2d09cb6
 
 ## Data model: the Properties database
 
-One row per building, keyed by BBL. 27 fields, listed with types and who writes each in `docs/NOTION.md`. Role is Deal or Comp;
-a comp becomes a deal by changing Role. Strategy is Flip, Rent, Build or Not set and gates exit comps and rents. Anything else
-about a property lives on its page, not on the row. Scripts write only field names that exist in the live schema, so deleting a
-field in Notion does not break them.
+One row per property or amenity. Type is Deal, Comp, Restaurant, Park or Subway station; the old Role field was renamed in
+place. Properties are keyed by BBL; amenities by Source ID. Location powers native map views. Property-only fields stay
+empty on amenities. Fields and ownership are in `docs/NOTION.md`. Strategy is Flip, Rent, Build or Not set for property work.
 
 ## Flow of one job
 
@@ -98,7 +97,58 @@ re-run only when facts or comps need refreshing.
 - The instructions live in this repo, not Notion, and the four documents under `docs/` are agent-neutral: anything specific to
   one agent goes in `docs/agents/`. Edit the markdown, commit, push; the agent picks it up on its next bootstrap.
 
-## State as of 2026-10-21
+## Current state
+
+### Shared map database, 2026-10-28
+
+- Notion MCP reconnected to Noah Pan's Notion. Role was renamed to Type with its original property ID; all 23 deals and
+  157 comps retained their page IDs, fields and relationships. Location, Source ID and Source URL were added.
+- All 180 property locations were populated from NYC lot coordinates. Property page bodies and Noah's notes were untouched.
+- Native views: All records, Deals map, Comps map, Neighborhood map and Amenities. Deals map is verified to return only
+  the 23 deals; map quick filters allow neighborhood selection. Each map displays at most 100 pins at once.
+- The Properties table retains a property-only comparison view. There are 298 located records in total: 180 original
+  properties plus 56 city-matched restaurants/cafes, 25 parks and 37 subway stations. Amenity Source IDs are unique.
+- Full property comparison against the pre-migration snapshot verified every original field and relation, with Role mapped
+  to Type by the same property ID. The shared-directory dry run for 278A 9 Street completed in 55 seconds, with no Places
+  search and no map-image rendering. The regression suite passes 23 checks, including shared-directory reuse.
+- `scripts/map_database.py` imports sourced amenities by stable IDs and safely resumes location filling. Existing area
+  entries were matched to MTA, NYC Parks and DOHMH restaurant records; Google ratings are not copied into the directory.
+  Unmatched or unsuitable entries remain in their original pages and in `.cache/migrations/type-map/unresolved-amenities.json`.
+- Normal screens reuse the directory and skip Places searches and PNG rendering. `--refresh-area` and `--map-images` are
+  explicit options. `data/amenities.json` is the portable directory; Notion writes read current amenity records from Notion.
+- The Notion client retries transient 5xx errors for idempotent reads/updates. It does not blindly retry page creation on a 5xx.
+
+### Update: 2026-10-28, 278A 9 Street feedback
+
+- Instinct's run took 83 seconds (about 60 on ACRIS), then about 12 minutes of manual finish and 4 minutes of corrections.
+  The outstanding work is mostly listing review, not script runtime.
+- Fixed missing BIN/BIS links for buildings with no DOB/HPD activity: query NYC building-footprint centroids by `base_bbl`.
+  PAD `bc8t-ecyu` is a downloadable ZIP and cannot be queried as previously documented. The fallback returns BIN 3022256
+  for 278A 9 Street (3010100021). Missing BIN remains unknown with an open item.
+- Food pins now require a restaurant/cafe/bakery primary type; a secondary cafe inside a supermarket or bookstore is excluded.
+  Park distances and pins use the nearest polygon edge, labeled as such. Map pins use output-scale spacing and leaders.
+- Added `scripts/listing_media.py`: automatic floor-plan extraction from a rendered listing through local Chrome DevTools,
+  or saved rendered HTML; explicit `--floor-plan` fallback, bounded image decoding and conservative cropping. No plain
+  request to a listing page and no workaround for site blocks. Browser/image packages are optional at runtime.
+- Added `scripts/comp_review.py` and `data/reviews/3010100021.json`, preserving Instinct's listing pass with its provenance.
+  Reviews are sale-specific (BBL + date); renovated/new sales leave purchase comps. The full candidate set and city data
+  are saved in each screen JSON. `--refresh` redraws the table/map without another ACRIS search; `--notion-refresh` updates
+  only affected sections after fresh city queries. Both limited Notion modes preserve hand-finished facts and Noah's notes.
+- Fresh local run on 278A 9 Street: 71 seconds total, about 36 seconds on the ACRIS comp search; 111 candidates, five selected
+  purchase comps, three renovated sales withheld, automatic floor-plan retrieval, and Prospect Park 0.68 mi to edge.
+  A second fresh run with Noah's `GOOGLE_PLACES_API_KEY` from his local zsh configuration took 63 seconds (51 on the ACRIS
+  comp search). The live food filter returned Chela, Bison & Bourbon, Terrace Restaurant & Bakery, Table 87 and Masalawala
+  & Sons; no supermarkets or bookstores. That run's browser was unavailable; the saved rendered listing HTML supports
+  floor-plan extraction without repeating city queries. The original browser extraction was verified in the first run.
+- `GOOGLE_PLACES_API_KEY` is now supported directly and takes precedence for Places; `GOOGLE_MAPS_API_KEY` remains its
+  fallback and the Street View key. Local gitignored `.env` integration settings are also read without executing shell code.
+- Regression checks: `python3 -m unittest discover -s tests -v` (19 checks passing).
+- The limited live Notion refresh completed in 32 seconds after local rendering. Verified against a pre-update snapshot:
+  the original photo, opening paragraph, listing/tax Details table, and Noah's notes block IDs/content were preserved;
+  Area and the cropped floor plan were replaced, and the purchase table/map/relation now contain the same five comps.
+  This verifies the limited update path; the older full-rebuild update path remains a separate unverified path.
+
+### Earlier state
 
 - 2026-10-21 (evening): first live job by Instinct from a fresh sandbox: 236 Schaefer Street, Bushwick (BBL 3034300020),
   Investigate, Strategy Not set, 18 minutes end to end of which the script took about 8. Its feedback led to this commit: comp

@@ -50,6 +50,9 @@ Lot size: 12.75 ft wide and 676 sf, under the 18 ft and 1,700 sf minimums, but e
 
 ### Area
 
+[Default: link to the native Neighborhood map and a short list of nearby shared places. Reuse the existing directory;
+no new restaurant search or image rendering on an ordinary run. The image layout below is for an explicit --map-images export.]
+
 [The area map (`PLAYBOOK.md`, section 5), then in this order: one caption line, the pin list as numbered blocks grouped by type with each line colored like its pins, and one sentence only for a negative (historic district or flood zone). No new-building projects, no sentence on development pace.]
 
 Map: OpenStreetMap tiles © OpenStreetMap contributors · NYC 2020 neighborhood boundaries · MTA stations · Google Places · NYC Parks · checked 2026-10-16 · straight-line miles
@@ -69,6 +72,9 @@ Map: OpenStreetMap tiles © OpenStreetMap contributors · NYC 2020 neighborhood 
 | 2 | 2 / 1 | $3,100 | August 2026 | [building page, when the unit has no page] |
 
 ### Purchase comps
+
+[Default: use the native Comps map in the shared database. The table and linked property rows remain on the deal page;
+the generated map image below is an explicit legacy export.]
 
 [The comps map: same basemap and frame, comps numbered in table order, filled pin for a closed sale, hollow for a listing, no text in the image. Then every qualifying comp, up to 8 rows, nearest first: closed ACRIS deeds only, as-is sales of the same product family. Then one sentence naming the best analogs against the ask and any lot that sold twice. No implied-value range.]
 
@@ -102,7 +108,7 @@ Run log: [2026-10-16 · stages 0-3 · created]
 
 ## Comp page
 
-[For a row with Role Comp. 150 words excluding tables. No maps, no zoning block, no comps of its own.]
+[For a row with Type Comp. 150 words excluding tables. No maps, no zoning block, no comps of its own.]
 
 [IMAGE: the lead photo from the sold listing; failing that, Street View; failing both, the links line begins "No photo · "]
 

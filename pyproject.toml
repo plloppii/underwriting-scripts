@@ -1,14 +1,9 @@
 [project]
-name = "notion-underwriting"
-version = "0.2.1"
-description = "Noah's NYC property underwriting system: the agent playbook and page template, the Properties database scripts, and the Open Data screening script"
+name = "underwriting-scripts"
+version = "0.3.0"
+description = "Independent NYC property and neighborhood JSON data tools"
 requires-python = ">=3.10"
-dependencies = [
-    "requests>=2.31",
-    "websocket-client>=1.8",  # Chrome DevTools for rendered listing media
-    "matplotlib>=3.7",   # maps; optional at runtime, the script runs without it
-    "pillow>=10",        # maps; optional at runtime
-]
+dependencies = ["requests>=2.31"]
 
 [tool.uv]
 package = false

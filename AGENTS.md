@@ -6,6 +6,8 @@ writes belong to `notion-agentic-skills`; begin there for a full deal workflow.
 
 - Read `README.md`, `docs/SOURCES.md`, and the applicable `docs/PLACES.md` or
   `docs/HOUSING.md` before changing a source adapter.
+- Refer to the person using these tools as **User**. Keep personal names and
+  person-specific settings out of tracked content.
 - Keep each data command independently runnable. Emit one JSON document on
   stdout, with progress/errors on stderr or in explicit JSON error fields.
 - Data collection must not import Notion helpers, read private settings, load a

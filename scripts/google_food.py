@@ -28,5 +28,3 @@ def places_food(lat: float, lon: float, radius_m: int = 800, limit: int = 5) -> 
                     "rating": pl["rating"], "ratings": int(pl.get("userRatingCount") or 0),
                     "lat": pl["location"]["latitude"], "lon": pl["location"]["longitude"]})
     return sorted(out, key=lambda f: -(f["rating"] * math.log10(f["ratings"] + 1)))[:limit]
-
-

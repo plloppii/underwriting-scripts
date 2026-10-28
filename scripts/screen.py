@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 import property_sources as data
 from housing_developments import resolve_origin
+from property_tasks import numeric_facts
 
 
 def collect(args):
@@ -54,12 +55,7 @@ def collect(args):
             stage("renovation_signals", lambda: data.renovation_signal(comps[:8]))
     else:
         result["candidate_comps"] = []
-    result["numeric"] = {}
-    for key in ("lotarea", "residfar", "bldgarea"):
-        result["numeric"][key] = data.fnum(p.get(key))
-    area, far, built = (result["numeric"][key] for key in ("lotarea", "residfar", "bldgarea"))
-    maximum = area * far if area is not None and far is not None else None
-    result["numeric"].update({"max_zfa": maximum, "unused_sf": maximum - built if maximum is not None and built is not None else None})
+    result["numeric"] = numeric_facts(p)
     result["status"] = "partial" if result["errors"] else "complete"
     return result
 
@@ -72,7 +68,7 @@ def main(argv=None):
     parser.add_argument("--radius", type=float, default=0.5, help="candidate sales radius in miles")
     parser.add_argument("--months", type=int, default=18)
     parser.add_argument("--min-amt", type=float, default=100000)
-    parser.add_argument("--no-comps", action="store_true")
+    parser.add_argument("--no-comps", action="store_true", help="skip comps; still fetch the other property sections")
     parser.add_argument("--out", type=Path, help="also save JSON to a file")
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)

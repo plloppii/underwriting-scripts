@@ -231,18 +231,46 @@ def acris_parties(doc_id: str) -> dict:
     return out
 
 
-def dob_facts(boro: str, block: str, lot: str, bbl: str) -> dict:
+def dob_violation_rows(boro: str, block: str, lot: str) -> list[dict]:
     b5, l5, l4 = block.zfill(5), lot.zfill(5), lot.zfill(4)
     viol = soda(DS["dobviol"], {"$where": f"boro='{boro}' AND block='{b5}' AND lot='{l5}'",
                                 "$select": "bin,issue_date,violation_category,violation_type,disposition_date"})
+
+    return viol
+
+
+def ecb_violation_rows(boro: str, block: str, lot: str) -> list[dict]:
+    b5, l5, l4 = block.zfill(5), lot.zfill(5), lot.zfill(4)
     ecb = soda(DS["ecb"], {"$where": f"boro='{boro}' AND block='{b5}' AND lot='{l4}'",
                            "$select": "bin,issue_date,ecb_violation_status,severity,violation_description,balance_due"})
+
+    return ecb
+
+
+def hpd_violation_rows(bbl: str) -> list[dict]:
+    hpd = soda(DS["hpd"], {"$where": f"bbl='{bbl}'", "$select": "class,violationstatus,novissueddate,novdescription,registrationid,bin,buildingid"})
+
+    return hpd
+
+
+def bis_job_rows(bbl: str) -> list[dict]:
     bis = soda(DS["bisjobs"], {"$where": f"bbl='{bbl}'",
                                "$select": "job__,job_type,job_status_descrp,pre__filing_date,latest_action_date,proposed_dwelling_units,proposed_zoning_sqft,bin__,job_description"})
+
+    return bis
+
+
+def dobnow_job_rows(bbl: str) -> list[dict]:
     now = soda(DS["dobnow"], {"$where": f"bbl='{bbl}'",
                               "$select": "job_filing_number,job_type,filing_status,filing_date,approved_date,signoff_date,proposed_dwelling_units,total_construction_floor_area,bin,job_description"})
-    hpd = soda(DS["hpd"], {"$where": f"bbl='{bbl}'", "$select": "class,violationstatus,novissueddate,novdescription,registrationid,bin,buildingid"})
-    bins = {x.get("bin") for x in viol} | {x.get("bin") for x in ecb} | {x.get("bin__") for x in bis} | {x.get("bin") for x in now} | {x.get("bin") for x in hpd}
+
+    return now
+
+
+def summarize_building_facts(bbl: str, viol: list, ecb: list, bis: list, now: list, hpd: list) -> dict:
+    bins = ({x.get("bin") for x in viol} | {x.get("bin") for x in ecb}
+            | {x.get("bin__") for x in bis} | {x.get("bin") for x in now}
+            | {x.get("bin") for x in hpd})
     bins = sorted(str(b) for b in bins if b and re.fullmatch(r"[1-5]\d{6}", str(b)) and str(b)[1:] != "000000")
     bin_source, bin_error = "DOB / HPD", None
     if not bins:
@@ -263,6 +291,15 @@ def dob_facts(boro: str, block: str, lot: str, bbl: str) -> dict:
             "hpd_total": len(hpd), "hpd_open": len(hpd_open), "hpd_open_by_class": hpd_by_class,
             "hpd_registered": any(v.get("registrationid") for v in hpd), "active_dobnow": active_now,
             "hpd_building_id": next((v["buildingid"] for v in hpd if v.get("buildingid")), None)}
+
+
+
+def dob_facts(boro: str, block: str, lot: str, bbl: str) -> dict:
+    """Combined compatibility view over the same independent source queries."""
+    return summarize_building_facts(
+        bbl, dob_violation_rows(boro, block, lot), ecb_violation_rows(boro, block, lot),
+        bis_job_rows(bbl), dobnow_job_rows(bbl), hpd_violation_rows(bbl),
+    )
 
 
 def near_corner_estimate(p: dict) -> dict | None:

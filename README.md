@@ -22,6 +22,12 @@ python3 scripts/property.py --check
 | Command | Result |
 | --- | --- |
 | `scripts/property.py` or `scripts/screen.py` | PLUTO facts, deeds/parties, DOB/ECB/HPD facts, flood checks and candidate closed sales. |
+| `scripts/property_facts.py` | Just the property/lot/zoning facts, numeric estimates and corner geometry. |
+| `scripts/sales_history.py` | Just recorded deeds and the latest deed's buyer/seller parties. |
+| `scripts/violations.py` | Just DOB, ECB and HPD violation records. |
+| `scripts/permits.py` | Just BIS and DOB NOW construction/job filings. |
+| `scripts/flood.py` | Just the effective and preliminary flood-map checks. |
+| `scripts/comps.py` | Just candidate closed sales and alteration signals on the first eight. |
 | `scripts/restaurants.py` | Nearby city inspection-record businesses, deduplicated by CAMIS. |
 | `scripts/train_stations.py` | MTA subway station records with GTFS IDs and routes. |
 | `scripts/parks.py` | NYC Parks properties and nearest-polygon distances. |
@@ -29,6 +35,8 @@ python3 scripts/property.py --check
 
 ```sh
 python3 scripts/property.py --bbl 3010100021 --radius 0.5 --months 18 --out /tmp/property.json
+python3 scripts/violations.py --bbl 3010100021
+python3 scripts/comps.py --bbl 3010100021 --radius 0.5 --months 18
 python3 scripts/restaurants.py --bbl 3010100021 --radius-mi 0.5
 python3 scripts/train_stations.py --lat 40.67 --lon -73.99 --radius-mi 0.5
 python3 scripts/parks.py "278A 9 STREET" --borough BK --radius-mi 1
@@ -36,9 +44,15 @@ python3 scripts/housing_developments.py --bbl 3010100021 --radius-mi 1
 ```
 
 An address requires its borough; a BBL avoids address-spelling ambiguity. Place
-commands also accept coordinates. The property command has `--no-comps` for a
-facts-only pull. `--out` saves the same JSON printed to stdout; progress uses
+commands also accept coordinates. The property command's `--no-comps` skips
+comps but still fetches its other sections; use `property_facts.py` for just lot
+and zoning facts. `--out` saves the same JSON printed to stdout; progress uses
 stderr. No place search runs implicitly as part of a property screen.
+
+The six individual property commands share the fetching implementation with
+the combined command, and do not run unrelated tasks. Their
+[JSON interfaces](docs/PROPERTY_TASKS.md) describe records, partial failures and
+the compatibility of the combined output.
 
 Exit 0 means the selected queries succeeded, 1 means a supported multi-source
 query is partial, and 2 means failure or invalid input. Inspect `status` and

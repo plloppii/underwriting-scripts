@@ -2,6 +2,11 @@
 
 Source/API recipes for independent data tools. Public property helpers live in `scripts/property_sources.py`; place sources live in `scripts/place_sources.py`. Browser-only evidence and Notion output are handled by the consuming skill in `notion-agentic-skills`. Example values use 63 Irving Place, Brooklyn (BBL 3019840005).
 
+The individual `property_facts.py`, `sales_history.py`, `violations.py`,
+`permits.py`, `flood.py`, and `comps.py` commands use those same helpers.
+[PROPERTY_TASKS.md](PROPERTY_TASKS.md) documents the source boundaries and JSON
+fields. `property.py` remains the combined interface.
+
 Standalone public/affordable housing research uses `scripts/housing_developments.py`,
 independently of the consuming skill and Notion output. It queries NYCHA development
 boundaries (`phvi-damg`) and HPD Affordable Housing Production by Building
